@@ -1,5 +1,7 @@
 # agy-call
 
+![agy-call demo: a reply in the wrong format is resumed in the same conversation, and one quota error stops a whole batch](docs/demo.gif)
+
 ## What it does
 
 Claude Code can hand work to Google's Gemini through the `agy` CLI: a question, a review, or a batch of tasks.
@@ -21,6 +23,7 @@ The optional guard hook stops Claude from calling `agy` directly, so every call 
 agy-call is a standard-library Python wrapper through which every call to agy (Antigravity, Gemini) goes, so no paid reply is lost and a quota error stops all callers.
 Run the tests with `uvx pytest -q tests/`.
 `skills/agy-call/SKILL.md` is the user guide.
+`docs/demo/` regenerates the demo GIF with the test suite's fake delegate, so it spends no Gemini quota.
 
 ## Install
 
