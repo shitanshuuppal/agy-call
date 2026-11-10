@@ -58,6 +58,7 @@ Batch exits 0 when every job is done, 10 when any job hit a quota hold, and 20 o
 
 ```python
 import os, sys
+# the folder that holds agycall/: your clone, or for a plugin install the parent of the folder holding $(realpath $(which agy-call))
 sys.path.insert(0, os.path.expanduser("~/Code/agy-call"))
 from agycall import call, batch, AgyCallError, Quota
 ```

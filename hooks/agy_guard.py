@@ -3,7 +3,7 @@
 
 The match is on the whole command text (quoted strings, bash -c arguments and heredoc bodies included), so a command
 that only mentions these names is refused too; that is deliberate: anything that could run agy goes through agy-call.
-Tests: uvx pytest ~/Code/agy-call/tests/test_guard.py
+Tests: uvx pytest tests/test_guard.py
 """
 import json
 import re
@@ -15,7 +15,7 @@ SAFE = re.compile(r"(?<![\w.-])(?:[^\s'\"]*/)?agy(?![\w-])[ \t]+(?:models|mcp|--
 REASON = ("Direct agy, agy-delegate and agy-job calls are blocked: they lose paid replies. Use agy-call, which saves every reply, "
           "resumes the same conversation and honours the shared quota hold:\n"
           "  agy-call run --job <id> --store <project dir>/agy-jobs --model gemini-4-argon-high --prompt-file <file> [--expect json --require a,b]\n"
-          "Run it with run_in_background for long jobs. See the agy-call skill (~/.claude/skills/agy-call/SKILL.md).")
+          "Run it with run_in_background for long jobs. See the agy-call skill.")
 
 
 def blocked(command):

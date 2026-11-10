@@ -20,24 +20,46 @@ The optional guard hook stops Claude from calling `agy` directly, so every call 
 
 agy-call is a standard-library Python wrapper through which every call to agy (Antigravity, Gemini) goes, so no paid reply is lost and a quota error stops all callers.
 Run the tests with `uvx pytest -q tests/`.
-`SKILL.md` is the user guide.
+`skills/agy-call/SKILL.md` is the user guide.
 
 ## Install
 
-Requirements: Python 3 (standard library only), the `agy` CLI installed and signed in, and the Antigravity Claude Code plugin (`antigravity-for-claude-code`), which puts `agy-delegate` on the PATH inside Claude Code sessions.
-The steps below assume the repo is cloned to `~/Code/agy-call`; use your own path if it differs.
+Requirements: Python 3 (standard library only), the `agy` CLI installed and signed in, and the Antigravity Claude Code plugin (`antigravity-for-claude-code`), which puts its delegate script on the PATH inside Claude Code sessions.
+
+### As a Claude Code plugin
+
+In Claude Code 2.1.275 or later:
+
+```
+/plugin install agy-call --marketplace shitanshuuppal/agy-call
+```
+
+In older versions:
+
+```
+/plugin marketplace add shitanshuuppal/agy-call
+/plugin install agy-call@agy-call
+```
+
+Restart Claude Code afterwards.
+The plugin installs the skill, puts the `agy-call` command on the PATH inside Claude Code sessions, and turns on the guard hook, which refuses Bash commands that call agy directly so every call goes through agy-call.
+
+### Manual install
+
+Use this if you want `agy-call` on the PATH outside Claude Code too.
+The steps assume the repo is cloned to `~/Code/agy-call`; use your own path if it differs.
 
 ```sh
 git clone https://github.com/shitanshuuppal/agy-call.git ~/Code/agy-call
 mkdir -p ~/.claude/skills/agy-call ~/.local/bin ~/.claude/hooks
-ln -s ~/Code/agy-call/SKILL.md ~/.claude/skills/agy-call/SKILL.md
+ln -s ~/Code/agy-call/skills/agy-call/SKILL.md ~/.claude/skills/agy-call/SKILL.md
 ln -s ~/Code/agy-call/bin/agy-call ~/.local/bin/agy-call
 ln -s ~/Code/agy-call/hooks/agy_guard.py ~/.claude/hooks/agy_guard.py
 ```
 
 `~/.local/bin` must be on the PATH; check with `agy-call --help`.
 
-The guard hook is optional but recommended: it refuses Bash commands that call agy directly, so every call goes through agy-call.
+The guard hook is optional but recommended.
 To enable it, add this entry under `hooks.PreToolUse` in `~/.claude/settings.json`, with your own absolute home path:
 
 ```json

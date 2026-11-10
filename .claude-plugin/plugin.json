@@ -1,0 +1,12 @@
+{
+  "name": "agy-call",
+  "version": "0.1.0",
+  "description": "Route every agy (Antigravity, Gemini) call from Claude Code through one runner that saves every reply, resumes the same conversation when a reply is unusable, and stops all callers on a quota error.",
+  "author": {
+    "name": "Shitanshu Uppal"
+  },
+  "homepage": "https://github.com/shitanshuuppal/agy-call",
+  "repository": "https://github.com/shitanshuuppal/agy-call",
+  "license": "MIT",
+  "keywords": ["antigravity", "agy", "gemini", "quota", "retry", "claude-code"]
+}
