@@ -1,4 +1,5 @@
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import pytest
 
 from agycall import control, store, task, worktree
 from agycall.errors import Mismatch, RepoState, Running
-from agyturns import bounded, git, reply
+from agyturns import bounded, git, reply, wait_for
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
@@ -260,3 +261,57 @@ def test_merge_reads_the_task_record_after_taking_the_locks(repo, fake, monkeypa
     monkeypatch.setattr(worktree, "lock", replaced)
     text, code = worktree.merge("t1")
     assert code == 20 and not os.path.exists(job.path("merge.json"))
+
+
+def _merge_controller(repo, tmp_path):
+    """Start `agy-call task --merge t1` as its own process, and return it."""
+    code = "import sys; from agycall import worktree; worktree.merge('t1')"
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
+    return subprocess.Popen([sys.executable, "-c", code], cwd=str(repo), env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+def _killed_controller_leaves_the_locks_held(repo, tmp_path, controller, child_pid):
+    os.kill(controller.pid, signal.SIGKILL)
+    bounded(lambda: controller.wait(timeout=30), [controller.pid])
+    os.kill(child_pid, 0)  # the child outlived its controller
+    for call in (lambda: worktree.cleanup("t1"), lambda: worktree.merge("t1"), lambda: worktree.discard("t1")):
+        with pytest.raises(Running):
+            bounded(call)
+
+
+def test_a_killed_merge_controller_leaves_the_locks_held_while_its_check_runs(repo, fake, tmp_path):
+    flag, pidfile = tmp_path / "flag", tmp_path / "pid"
+    check = "test -f b.txt; if [ -f %s ]; then echo $$ > %s; sleep 60; fi" % (flag, pidfile)
+    _committed_task(fake, check=check)
+    flag.write_text("x")
+    controller, child = _merge_controller(repo, tmp_path), []
+    try:
+        child.append(int(wait_for(lambda: pidfile.exists() and pidfile.read_text().strip())))
+        _killed_controller_leaves_the_locks_held(repo, tmp_path, controller, child[0])
+    finally:
+        controller.kill()
+        for pid in child:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_a_killed_merge_controller_leaves_the_locks_held_while_git_merge_runs(repo, fake, tmp_path):
+    pidfile = tmp_path / "pid"
+    _committed_task(fake)
+    hook = repo / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text("#!/bin/sh\necho $$ > %s\nexec sleep 60\n" % pidfile)
+    hook.chmod(0o755)
+    controller, child = _merge_controller(repo, tmp_path), []
+    try:
+        child.append(int(wait_for(lambda: pidfile.exists() and pidfile.read_text().strip())))
+        _killed_controller_leaves_the_locks_held(repo, tmp_path, controller, child[0])
+    finally:
+        controller.kill()
+        for pid in child:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass

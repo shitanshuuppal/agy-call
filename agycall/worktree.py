@@ -122,19 +122,20 @@ def _rev(cwd, ref):
 @contextlib.contextmanager
 def _held(job_id, cwd):
     """A task's repository, job and task record, with the job lock taken without blocking (Running, exit 25, while the
-    job runs or another command holds it) and then the repository lock, both held until the block ends."""
+    job runs or another command holds it) and then the repository lock, both held until the block ends.
+    Also yields the two lock descriptors, which a subprocess that must outlive its controller inherits so the locks stay held."""
     r = repo(cwd)
     job = st.Job(r.store, job_id)
     with contextlib.ExitStack() as stack:
         try:
-            stack.enter_context(st.flock(job.lock_path, blocking=False))
+            job_lock = stack.enter_context(st.flock(job.lock_path, blocking=False))
         except st.Busy:
             raise Running("task %s is running or another agy-call command holds it" % job_id)
-        stack.enter_context(lock(r))
+        repo_lock = stack.enter_context(lock(r))
         t = (st.read_json(job.path("request.json"), {}) or {}).get("task")  # read under the locks: --new-version replaces it
         if not t:
             raise ValueError("no task %s in %s" % (job_id, r.store))
-        yield r, job, t
+        yield r, job, t, (job_lock.fileno(), repo_lock.fileno())
 
 
 def _main_ready(top, base):
@@ -149,7 +150,7 @@ def merge(job_id, cwd=None):
     """`agy-call task --merge JOB` (spec 4.8): check the task branch tip in its worktree and merge it into the base
     branch of the main checkout with a merge commit. Returns (text, exit code): 0 merged, 20 the check failed; every
     refusal raises RepoState (26) and leaves the main checkout as it was."""
-    with _held(job_id, cwd) as (r, job, t):
+    with _held(job_id, cwd) as (r, job, t, fds):
         wt, br, base, top = t["worktree"], t["branch"], t["baseBranch"], t["checkout"]
         if not os.path.isdir(wt):
             raise RepoState("the worktree %s of task %s is missing" % (wt, job_id))
@@ -170,7 +171,7 @@ def merge(job_id, cwd=None):
                 answer = fh.read()
         except OSError:
             answer = ""
-        findings = checks.run_cmd(t["check"], answer, t["checkTimeout"], cwd=wt, combined=True)
+        findings = checks.run_cmd(t["check"], answer, t["checkTimeout"], cwd=wt, combined=True, fds=fds)
         if findings:
             return "the check failed on %s, so nothing was merged:\n%s" % (task_commit, findings[0]), 20
         if changes(wt) or _rev(wt, "HEAD") != task_commit or _rev(top, "refs/heads/" + br) != task_commit:
@@ -180,7 +181,7 @@ def merge(job_id, cwd=None):
         if _rev(top, "refs/heads/" + base) != base_tip:
             raise RepoState("%s moved while the check ran, so nothing was merged" % base)
         p = subprocess.run(["git", "merge", "--no-ff", "--no-edit", "-m", "Merge agy task %s" % job_id, br], cwd=top,
-                           capture_output=True, text=True, env=dict(os.environ, GIT_EDITOR="true"))
+                           capture_output=True, text=True, env=dict(os.environ, GIT_EDITOR="true"), pass_fds=fds)
         if p.returncode:
             output = (p.stdout + p.stderr).strip()
             conflicts = git(top, "diff", "--name-only", "--diff-filter=U").split()
@@ -224,7 +225,7 @@ def _remove(r, job, t, action):
 def cleanup(job_id, cwd=None):
     """`agy-call task --cleanup JOB` (spec 4.9): remove a task's worktree and branch once the branch is merged into its
     base branch."""
-    with _held(job_id, cwd) as (r, job, t):
+    with _held(job_id, cwd) as (r, job, t, _):
         gone = st.read_json(job.path("cleanup.json"))
         if gone:
             return "task %s was already removed by --%s" % (job_id, gone["action"]), 0
@@ -237,7 +238,7 @@ def cleanup(job_id, cwd=None):
 def discard(job_id, cwd=None):
     """`agy-call task --discard JOB` (spec 4.9): drop a task, merged or not, when its worktree has no uncommitted
     change."""
-    with _held(job_id, cwd) as (r, job, t):
+    with _held(job_id, cwd) as (r, job, t, _):
         gone = st.read_json(job.path("cleanup.json"))
         if gone:
             return "task %s was already removed by --%s" % (job_id, gone["action"]), 0
