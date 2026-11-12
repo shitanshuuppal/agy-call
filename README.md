@@ -52,6 +52,7 @@ A review follows the same path with a read-only snapshot instead of a worktree.
 The commands use the model `gemini-4-argon-high`, and reviews `--effort high`, unless you name others.
 Claude never starts a fix or a second review by itself after a review; that follows your own instructions.
 `skills/agy-call/SKILL.md` documents every `agy-call` command and option, including `run` and `batch` for questions and scripts.
+[`docs/USAGE.md`](docs/USAGE.md) is a practical guide: which work to hand to Gemini, how to ask in plain words, how to write a task Gemini can finish, reviews, scripts and batches, and a first run.
 
 ## What a task's permission grant does and does not do
 
