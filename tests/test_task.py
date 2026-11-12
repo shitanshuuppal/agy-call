@@ -8,8 +8,8 @@ import time
 import pytest
 
 from agycall import agy, control, quota, runner, store, task, worktree
-from agycall.errors import Blocked, Fatal, GaveUp, Mismatch, Quota, RepoState
-from agyturns import denied, empty, error_reply, git, model_error, partial, quota_error, reply
+from agycall.errors import Blocked, Cancelled, Fatal, GaveUp, Mismatch, NoConversation, Quota, RepoState, Running
+from agyturns import denied, empty, error_reply, git, model_error, partial, quota_error, reply, wait_for
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
@@ -313,3 +313,108 @@ def test_a_task_whose_controller_died_sends_no_automatic_turn(repo, fake):
         with pytest.raises(GaveUp, match="nothing was resent"):
             task.drive(job)
     assert launches() == [] and store.read_json(os.path.join(att, "result.json"))["outcome"] == "interrupted"
+
+
+def test_continue_appends_a_segment_in_the_same_worktree_and_conversation(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}), reply("Created c.txt.", write={"c.txt": "c\n"}))
+    job = _start()
+    task.drive(job)
+    store.write_atomic(job.path("cancel.request"), "{}")  # an old request must not stop the new segment
+    job = task.continue_("t1", "Add c.txt too.", allow=["make"], max_turns=2, deadline="1h")
+    assert task.drive(job).answer == "Created c.txt."
+    second = launches()[1]
+    assert second["argv"][second["argv"].index("--conversation") + 1] == "c1"
+    assert os.path.realpath(second["cwd"]) == os.path.realpath(_wt())
+    assert second["prompt"] == task.prompt(_wt(), ["make"], "Add c.txt too.")
+    assert second["argv"][second["argv"].index("--settings") + 1] == job.path("grant-2.json")
+    assert "command(make)" in second["settings"]["permissions"]["allow"]
+    assert "command(make)" not in launches()[0]["settings"]["permissions"]["allow"]
+    assert open(job.path("segments", "001-answer.txt")).read() == "Created b.txt."
+    assert open(job.path("answer.txt")).read() == "Created c.txt."
+    assert os.path.exists(job.path("cancel.request.002.done")) and not os.path.exists(job.path("cancel.request"))
+    seg = store.read_json(job.path("segments", "002.json"))
+    assert seg["maxTurns"] == 2 and seg["deadline"] == "1h" and seg["grant"] == job.path("grant-2.json")
+    assert store.read_json(os.path.join(job.launched()[1], "launch.json"))["segment"] == 2
+
+
+def test_continue_after_blocked_and_after_cancelled_never_exits_24(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("NEED: make"), reply("Done.", write={"b.txt": "b\n"}))
+    job = _start()
+    with pytest.raises(Blocked):
+        task.drive(job)
+    assert task.drive(task.continue_("t1", "make is allowed now.", allow=["make"])).answer == "Done."
+    set_turns(reply("More.", write={"c.txt": "c\n"}))
+    job = task.continue_("t1", "One more thing.")
+    store.write_atomic(job.path("cancel.request"), "{}")
+    with pytest.raises(Cancelled):
+        task.drive(job)
+    assert job.status()["state"] == "cancelled" and len(launches()) == 2
+    assert task.drive(task.continue_("t1", "One more thing.")).answer == "More."
+    assert [l["argv"][l["argv"].index("--conversation") + 1] for l in launches()[1:]] == ["c1", "c1"]
+    assert store.read_json(job.path("segments", "004.json"))["grant"] == job.path("grant-2.json")  # no new --allow
+
+
+def test_continue_refuses_an_unknown_task_a_running_one_one_without_a_conversation_and_a_missing_worktree(repo, fake):
+    set_turns, _ = fake
+    with pytest.raises(ValueError, match="no task"):
+        task.continue_("nope", "x")
+    set_turns(empty())
+    job = _start()
+    with pytest.raises(GaveUp):
+        task.drive(job)
+    with store.flock(job.lock_path):
+        with pytest.raises(Running):
+            task.continue_("t1", "x")
+    with pytest.raises(NoConversation):
+        task.continue_("t1", "x")
+    git(repo, "worktree", "remove", "--force", _wt())
+    with pytest.raises(RepoState, match="missing"):
+        task.continue_("t1", "x")
+
+
+def test_continue_after_the_controller_died_settles_the_old_turn_first(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}), reply("Added d.", write={"d.txt": "d\n"}))
+    job = _start()
+    task.drive(job)
+    task.continue_("t1", "Add c.txt.")
+    att = job.new_attempt()  # segment 2's first turn: its controller died after agy wrote a complete reply
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "m",
+                                                         "conversation": "c1", "generation": 0, "segment": 2,
+                                                         "started": runner._now()})
+    with open(os.path.join(att, "agy.out"), "w") as fh:
+        fh.write(json.dumps({"status": "SUCCESS", "response": "the old reply", "conversation_id": "c1"}))
+    job = task.continue_("t1", "Add d.txt.")
+    assert store.read_json(os.path.join(att, "result.json"))["outcome"] == "interrupted"
+    assert task.drive(job).answer == "Added d."  # not the old reply
+    assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add d.txt.")
+
+
+def test_a_background_task_runs_in_a_detached_worker_and_is_found_from_its_worktree(repo, fake, tmp_path):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}, sleep=2), reply("Created c.txt.", write={"c.txt": "c\n"}))
+    (tmp_path / "one.md").write_text("Add b.txt.")
+    (tmp_path / "two.md").write_text("Add c.txt.")
+    env = dict(os.environ, PATH="/usr/bin:/bin")  # no agy-call on the PATH: the worker must use this checkout
+    r = run_cli("task", "--background", "--job", "t1", "--model", "m", "--check-cmd", "test -f b.txt",
+                "--prompt-file", str(tmp_path / "one.md"), cwd=str(repo), env=env)
+    assert r.returncode == 0 and r.stdout == "t1\n", r.stderr
+    job = store.Job(worktree.repo().store, "t1")
+    assert job.status()["state"] in ("queued", "running")  # the command returned while the turn still runs
+    wait_for(lambda: job.status().get("state") == "done")
+    r = run_cli("status", cwd=_wt(), env=env)  # from inside the task's worktree: the repository store
+    assert r.returncode == 0 and r.stdout.startswith("t1  done  task  "), r.stdout
+    r = run_cli("result", "t1", cwd=_wt(), env=env)
+    assert r.returncode == 0 and r.stdout.startswith("Created b.txt.\n") and "branch: agy/t1" in r.stdout
+    r = run_cli("task", "--continue", "--background", "--job", "t1", "--prompt-file", str(tmp_path / "two.md"),
+                cwd=str(repo), env=env)
+    assert r.returncode == 0
+    wait_for(lambda: job.status().get("state") == "done" and os.path.exists(job.path("answer.txt")))
+    assert open(job.path("answer.txt")).read() == "Created c.txt." and len(launches()) == 2
+    r = run_cli("status", "--all", cwd=str(tmp_path), env=env)
+    assert "%s (repository %s)\n  t1  done  task  " % (job.store, worktree.repo().top) in r.stdout
+    assert open(job.path("worker.log")).read().count("agy-call worker: done") == 2

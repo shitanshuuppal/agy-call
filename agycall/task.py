@@ -9,7 +9,7 @@ import re
 
 from . import agy, checks, runner, worktree
 from . import store as st
-from .errors import CheckError, Mismatch, RepoState
+from .errors import CheckError, Mismatch, NoConversation, RepoState
 
 READ_ONLY = ("ls", "cat", "head", "tail", "wc", "grep", "rg", "git status", "git diff", "git log", "git show")
 PROMPT = """You are working on a coding task in the git worktree {worktree}.
@@ -145,11 +145,17 @@ def _checker(check_cmd, check_timeout, wt):
     return check
 
 
+def _queue(job):
+    """Mark a task for the background worker: control.work reads the kind from background.json."""
+    st.write_atomic(job.path("background.json"), {"kind": "task"})
+    job.set_status(state="queued")
+
+
 def start(job_id, text, *, model, check_cmd, allow=(), effort=None, check_timeout=600, timeout="60m", max_turns=3,
-          deadline="2h", cwd=None, new_version=False):
+          deadline="2h", cwd=None, new_version=False, background=False):
     """`agy-call task` (spec 4.3): check the request; then, under the job lock and the repository lock, find the same
     request already recorded, or create the worktree, segment 1 with its grant, and request.json. Returns the job;
-    drive() runs it."""
+    drive() runs it, or with background the job is queued for control.spawn."""
     worktree.check_job_id(job_id)
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
@@ -183,6 +189,45 @@ def start(job_id, text, *, model, check_cmd, allow=(), effort=None, check_timeou
                 "task": {"repo": r.id, "checkout": r.top, "worktree": wt, "branch": worktree.branch(job_id),
                          "baseBranch": base_branch, "baseCommit": base_commit, "model": model, "effort": effort,
                          "allow": allow, "check": check_cmd, "checkTimeout": check_timeout, "timeout": timeout}})
+        if background:
+            _queue(job)
+    return job
+
+
+def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, background=False):
+    """`agy-call task --continue` (spec 4.7): under the job lock, append a segment to a task. A turn its controller left
+    unsettled is recorded as interrupted first, so its reply is never taken as the new segment's answer. The segment has
+    its own prompt, budget and deadline, and a new grant file when --allow adds commands; the previous answer moves to
+    segments/NNN-answer.txt and a pending cancel request is renamed, so neither ends the new segment."""
+    r = worktree.repo(cwd)
+    job = st.Job(r.store, job_id)
+    t = (st.read_json(job.path("request.json"), {}) or {}).get("task")
+    if not t or t.get("repo") != r.id:
+        raise ValueError("no task %s in %s" % (job_id, r.store))
+    with contextlib.ExitStack() as stack:
+        runner._lock(job, stack)
+        if not os.path.isdir(t["worktree"]):
+            raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
+                            % (t["worktree"], job_id))
+        att = runner.pending(job)
+        if att:
+            runner._interrupt(job, att)
+        if not job.status().get("conversation"):
+            raise NoConversation("task %s has no conversation to continue; its replies are in %s"
+                                 % (job_id, job.path("attempts")))
+        n = segments(job)[-1]
+        prev = st.read_json(_segment_path(job, n))
+        added = [a for a in dict.fromkeys(allow) if a not in prev["allow"]]
+        _validate(text, t["worktree"], prev["allow"] + added, t["timeout"], deadline, max_turns)
+        grant_n = int(re.search(r"grant-(\d+)\.json$", prev["grant"]).group(1)) + (1 if added else 0)
+        if os.path.exists(job.path("answer.txt")):
+            os.replace(job.path("answer.txt"), job.path("segments", "%03d-answer.txt" % n))
+        if os.path.exists(job.path("cancel.request")):
+            os.replace(job.path("cancel.request"), job.path("cancel.request.%03d.done" % (n + 1)))
+        _write_segment(job, n + 1, text, t["worktree"], prev["allow"] + added, grant_n, max_turns, deadline)
+        job.set_status(findings=[], need=[], denied=[])
+        if background:
+            _queue(job)
     return job
 
 

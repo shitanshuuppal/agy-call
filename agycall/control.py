@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from . import agy, runner, worktree
+from . import agy, runner, task, worktree
 from . import store as st
 from .errors import AgyCallError
 
@@ -103,8 +103,25 @@ def status(store, job_id=None):
     rows = []
     for job in jobs(store):
         finding = ((job.status().get("findings") or [""])[-1] or "").replace("\n", " ")[:100]
-        rows.append(("%s  %s  %s  %s" % (job.id, _state(job), _age(job), finding)).rstrip())
+        kind = _request(job).get("kind") or "run"
+        rows.append(("%s  %s  %s  %s  %s" % (job.id, _state(job), kind, _age(job), finding)).rstrip())
     return "\n".join(rows) or "no jobs in %s" % store, 0
+
+
+def status_all():
+    """(text, exit code) for `agy-call status --all`: every store under ~/.agy-call/jobs, repository stores and
+    namespace stores alike, one block per store that has jobs."""
+    root = os.path.join(st.home(), "jobs")
+    blocks = []
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        store = os.path.join(root, name)
+        found = jobs(store)
+        if not found:
+            continue
+        top = next(((_request(j).get("task") or {}).get("checkout") for j in found if _request(j).get("task")), None)
+        head = "%s (repository %s)" % (store, top) if top else store
+        blocks.append("\n".join([head] + ["  " + line for line in status(store)[0].splitlines()]))
+    return "\n\n".join(blocks) or "no jobs in %s" % root, 0
 
 
 def _newest_finished(store):
@@ -212,7 +229,11 @@ def cancel(store, job_id=None, wait=CANCEL_WAIT):
 
 def start(job_id, prompt, **kw):
     """`run --background`: record the run as queued and start a detached worker for it (spec 7.1); returns the job id."""
-    job = runner.enqueue(job_id, prompt, **kw)
+    return spawn(runner.enqueue(job_id, prompt, **kw))
+
+
+def spawn(job):
+    """Start the detached worker of a queued job, run or task; returns the job id."""
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (ROOT, os.environ.get("PYTHONPATH")) if p))
     exe = os.environ.get("AGYCALL_AGY") or shutil.which("agy")  # the worker starts in the job folder: make it absolute here
     if exe:
@@ -240,8 +261,12 @@ def work(store, job_id):
     """The worker: run the saved request; the outcome is in status.json, and one line goes to worker.log."""
     job = st.Job(store, job_id)
     identity = _request(job).get("identity")
+    args = st.read_json(job.path("background.json"))
     try:
-        runner.call(**st.read_json(job.path("background.json")))
+        if args.get("kind") == "task":
+            task.drive(job)
+        else:
+            runner.call(**args)
     except Exception as e:  # a start failure leaves the job queued: a schema file that has gone or changed
         code = e.code if isinstance(e, AgyCallError) else 2
         finding = str(e) if isinstance(e, AgyCallError) else "%s: %s" % (type(e).__name__, e)

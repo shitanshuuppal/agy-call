@@ -5,7 +5,7 @@ import collections
 import json
 import sys
 
-from . import control, task
+from . import control, task, worktree
 from . import store as st
 from .batch import batch
 from .errors import AgyCallError, Cancelled, Quota, RepoState, Running
@@ -80,9 +80,15 @@ def _task(a):
         raise ValueError("task needs --job and --prompt-file")
     with open(a.prompt_file, encoding="utf-8") as fh:
         text = fh.read()
-    job = task.start(a.job, text, model=a.model, check_cmd=a.check_cmd, allow=a.allow, effort=a.effort,
-                     check_timeout=a.check_timeout, timeout=a.timeout, max_turns=a.max_turns, deadline=a.deadline,
-                     new_version=a.new_version)
+    if a.cont:
+        job = task.continue_(a.job, text, allow=a.allow, max_turns=a.max_turns, deadline=a.deadline,
+                             background=a.background)
+    else:
+        job = task.start(a.job, text, model=a.model, check_cmd=a.check_cmd, allow=a.allow, effort=a.effort,
+                         check_timeout=a.check_timeout, timeout=a.timeout, max_turns=a.max_turns, deadline=a.deadline,
+                         new_version=a.new_version, background=a.background)
+    if a.background:
+        return control.spawn(job), 0
     try:
         task.drive(job)
     except (Running, RepoState):  # nothing ran: the job is held elsewhere, or its worktree is gone
@@ -90,6 +96,17 @@ def _task(a):
     except AgyCallError as e:  # a recorded failure: hand back the worktree, its branch and the last reply as well
         print("agy-call: %s" % e, file=sys.stderr)
     return control.result(job.store, job.id)
+
+
+def _store(a):
+    """--store or --namespace when given; else the repository store when the current directory is inside a git
+    repository; else the default store."""
+    if a.store or a.namespace:
+        return st.store_dir(a.store, a.namespace)
+    try:
+        return worktree.repo().store
+    except RepoState:
+        return st.store_dir()
 
 
 def main(argv):
@@ -113,6 +130,8 @@ def main(argv):
         p.add_argument("job", nargs="?")
         p.add_argument("--store")
         p.add_argument("--namespace")
+        if name == "status":
+            p.add_argument("--all", action="store_true")
     t = sub.add_parser("task")
     t.add_argument("--job")
     t.add_argument("--prompt-file")
@@ -125,6 +144,8 @@ def main(argv):
     t.add_argument("--max-turns", type=int, default=3)
     t.add_argument("--deadline", default="2h")
     t.add_argument("--new-version", action="store_true")
+    t.add_argument("--continue", action="store_true", dest="cont")
+    t.add_argument("--background", action="store_true")
     w = sub.add_parser("worker")  # started by run --background; not for direct use
     w.add_argument("--store", required=True)
     w.add_argument("--job", required=True)
@@ -138,8 +159,10 @@ def main(argv):
             return _run(a)
         if a.cmd == "task":
             text, code = _task(a)
+        elif a.cmd == "status" and a.all:
+            text, code = control.status_all()
         else:
-            text, code = getattr(control, a.cmd)(st.store_dir(a.store, a.namespace), a.job)
+            text, code = getattr(control, a.cmd)(_store(a), a.job)
     except AgyCallError as e:
         print("agy-call: %s" % e, file=sys.stderr)
         return e.code
