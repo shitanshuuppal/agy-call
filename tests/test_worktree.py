@@ -74,7 +74,7 @@ def test_create_refuses_a_detached_head_and_a_branch_or_folder_that_exists(repo)
 
 
 def test_task_ids_must_make_a_branch_name_git_accepts():
-    worktree.check_job_id("fix-1.2_x")
+    bounded(lambda: worktree.check_job_id("fix-1.2_x"))
     for bad in ("a..b", "a.lock", "a.", "-x", "a/b", ""):
         with pytest.raises(ValueError):
-            worktree.check_job_id(bad)
+            bounded(lambda bad=bad: worktree.check_job_id(bad))
