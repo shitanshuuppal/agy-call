@@ -181,7 +181,8 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
     size = len(prompt.encode("utf-8"))
-    if size > agy.MAX_PROMPT:
+    job = st.Job(st.store_dir(store, namespace), job_id)
+    if size > agy.MAX_PROMPT and not os.path.exists(job.path("answer.txt")):  # a saved answer is still returned
         raise ValueError("the prompt is %d bytes; agy takes it as one argument, and this system's limit is %d bytes: "
                          "put the material in a file under the working directory and refer to it" % (size, agy.MAX_PROMPT))
     agy.seconds(timeout)  # a bad timeout fails here, before any attempt folder exists
@@ -190,7 +191,6 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
     o = types.SimpleNamespace(model=model, timeout=timeout, mode=mode,
                               cwd=os.path.abspath(cwd or os.getcwd()), dirs=[os.path.abspath(d) for d in dirs])
     key = model
-    job = st.Job(st.store_dir(store, namespace), job_id)
     ident = st.identity(prompt, key, o.cwd, o.dirs, conversation, cident, mode)
     with contextlib.ExitStack() as stack:
         try:
@@ -236,6 +236,10 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                 raise GaveUp(findings, conv, _usage(job), job.dir)
             last_res.update(outcome="rejected", findings=verdict.findings, lostContext=verdict.lost_context)
             st.write_atomic(os.path.join(done[-1], "result.json"), last_res)
+        elif (last_res or {}).get("outcome") == "failed" and last_res.get("classified") in ("reply-with-error", "output-limit"):
+            findings = last_res.get("findings") or ["agy reported an error"]  # a rerun never sends a follow-up after an agy error
+            job.set_status(state="failed", findings=findings)
+            raise GaveUp(findings, conv, _usage(job), job.dir)
         while True:
             atts = job.launched()
             launches = [st.read_json(os.path.join(a, "launch.json"), {}) or {} for a in atts]
@@ -252,6 +256,12 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
             turns = sum(1 for l in launches if l.get("kind") not in ("retry", "retry-first"))
             if kind not in ("retry", "retry-first") and turns >= max_turns:
                 findings = (results[-1].get("findings") if results else None) or ["turn limit reached"]
+                job.set_status(state="failed", findings=findings)
+                raise GaveUp(findings, conv, _usage(job), job.dir)
+            size = len(message.encode("utf-8"))
+            if size > agy.MAX_PROMPT:
+                findings = ["the next message would be %d bytes, over this system's single-argument limit of %d bytes; "
+                            "rerun with --new-version and a shorter prompt" % (size, agy.MAX_PROMPT)]
                 job.set_status(state="failed", findings=findings)
                 raise GaveUp(findings, conv, _usage(job), job.dir)
             try:

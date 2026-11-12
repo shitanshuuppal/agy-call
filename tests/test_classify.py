@@ -82,3 +82,8 @@ def test_signal_kill_is_named():
 def test_envelope_tolerates_raw_newlines_and_bad_bytes():
     assert envelope(b'{"status": "SUCCESS", "response": "a\nb \xff"}')["response"] == "a\nb �"
     assert envelope(b"[1, 2]") is None
+
+
+def test_reply_text_with_error_phrases_stays_a_reply():
+    text = "quota exceeded; permission check failed; unauthenticated; deadline exceeded"
+    assert classify(0, env(response=text, conversation_id="c1"), "").name == "reply"

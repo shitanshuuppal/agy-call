@@ -541,3 +541,49 @@ def test_check_error_rerun_after_an_agy_error_sends_no_follow_up(tmp_path, fake,
         runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
     assert len(launches()) == 1 and "no follow-up was sent" in str(e.value)
     assert store.Job(S(tmp_path), "j1").status()["state"] == "failed"
+
+
+def test_rerun_of_a_failed_error_reply_sends_no_follow_up(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(error_reply(BAD["response"]), GOOD)
+    for max_turns in (4, 6):
+        with pytest.raises(GaveUp) as e:
+            runner.call("j1", "q", store=S(tmp_path), model="m", expect="json", max_turns=max_turns)
+        assert "no follow-up was sent" in str(e.value)
+    assert len(launches()) == 1
+
+
+def test_third_call_after_a_guarded_recheck_sends_no_follow_up(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    set_turns(error_reply("Implemented the change.", error="stream closed unexpectedly"), GOOD)
+    flag = tmp_path / "flag"
+    monkeypatch.setenv("FLAGFILE", str(flag))
+    cmd = 'test -f "$FLAGFILE" || exit 3; exit 1'
+    with pytest.raises(CheckError):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
+    flag.write_text("")
+    for _ in range(2):
+        with pytest.raises(GaveUp) as e:
+            runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
+        assert "no follow-up was sent" in str(e.value)
+    assert len(launches()) == 1
+
+
+def test_generated_follow_up_over_the_prompt_limit_is_refused(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    monkeypatch.setattr(agy, "MAX_PROMPT", 2000)
+    set_turns(reply('{"error": "missing_initial_prompt"}'), reply('{"action": "revise"}'))
+    with pytest.raises(GaveUp) as e:
+        runner.call("j1", "x" * 1900, store=S(tmp_path), model="m", expect="json", require=["action"])
+    assert "single-argument limit" in str(e.value)
+    assert len(launches()) == 1 and len(store.Job(S(tmp_path), "j1").launched()) == 1
+
+
+def test_saved_answer_is_returned_even_if_the_prompt_limit_shrinks(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    monkeypatch.setattr(agy, "MAX_PROMPT", 2000)
+    set_turns(reply("ok"))
+    runner.call("j1", "x" * 1500, store=S(tmp_path), model="m")
+    monkeypatch.setattr(agy, "MAX_PROMPT", 1000)
+    assert runner.call("j1", "x" * 1500, store=S(tmp_path), model="m").answer == "ok"
+    assert len(launches()) == 1
