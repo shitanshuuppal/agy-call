@@ -462,7 +462,7 @@ def test_a_rerun_after_cleanup_of_an_unfinished_review_makes_the_snapshot_again(
     assert os.path.isdir(rv["worktree"]) and _refs(repo) == ["refs/agy-call/" + job.id]
 
 
-def test_cleanup_after_the_snapshot_folder_was_deleted_drops_its_registration(repo, fake):
+def test_cleanup_after_the_snapshot_folder_was_deleted_drops_only_its_own_registration(repo, fake):
     set_turns, launches = fake
     _changed(repo, "a.txt")
     set_turns(quota_error(), reply(_review_json(["a.txt"])))
@@ -471,14 +471,18 @@ def test_cleanup_after_the_snapshot_folder_was_deleted_drops_its_registration(re
         review.drive(job)
     rv = _rv(job)
     other = worktree.repo().top + "-other"
-    git(repo, "worktree", "add", "-q", "--detach", other)  # an unrelated registration whose folder exists
+    away = other + "-away"
+    git(repo, "worktree", "add", "-q", "--detach", other)
+    os.rename(other, away)  # an unrelated worktree whose folder is temporarily missing
     shutil.rmtree(rv["worktree"])
     assert review.cleanup(job.id)[1] == 0 and _refs(repo) == []
     listed = git(repo, "worktree", "list")
-    assert rv["worktree"] not in listed and os.path.basename(other) in listed
+    assert rv["worktree"] not in listed and os.path.basename(other) in listed  # its registration is kept
     quota.clear("m", quota.generation("m"))
     assert review.drive(review.start(model="m")).text and len(launches()) == 2
     assert os.path.isdir(rv["worktree"])
+    os.rename(away, other)
+    assert git(other, "rev-parse", "--show-toplevel").strip()
     git(repo, "worktree", "remove", "--force", other)
 
 

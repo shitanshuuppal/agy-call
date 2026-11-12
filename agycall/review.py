@@ -3,6 +3,7 @@ prompt, the findings check, what `result` prints, and cleanup."""
 import collections
 import contextlib
 import datetime as dt
+import glob
 import hashlib
 import json
 import os
@@ -307,6 +308,20 @@ def render(job):
     return "\n".join(lines)
 
 
+def _drop_registration(top, path):
+    """Delete the administrative entry of the one worktree at path, found by the gitdir file that points at its .git;
+    other registrations are left alone, so no repository-wide `git worktree prune` is run."""
+    common = os.path.realpath(os.path.join(top, worktree.git(top, "rev-parse", "--git-common-dir").strip()))
+    want = os.path.realpath(os.path.join(path, ".git"))
+    for entry in glob.glob(os.path.join(glob.escape(common), "worktrees", "*")):
+        try:
+            with open(os.path.join(entry, "gitdir")) as f:
+                if os.path.realpath(f.read().strip()) == want:
+                    shutil.rmtree(entry)
+        except OSError:
+            pass
+
+
 def cleanup(job_id, cwd=None):
     """`agy-call review --cleanup JOB` (spec 8.3): under the job lock and the repository lock, remove the snapshot
     worktree and the snapshot ref, whichever still exist; the job record stays. Returns (text, 0)."""
@@ -321,7 +336,7 @@ def cleanup(job_id, cwd=None):
         if os.path.isdir(rv["worktree"]):
             worktree.git(r.top, "worktree", "remove", rv["worktree"])
         else:  # a deleted folder leaves git's registration behind, and a later `worktree add` would refuse it
-            worktree.git(r.top, "worktree", "prune")  # drops only registrations whose folder is gone
+            _drop_registration(r.top, rv["worktree"])
         if worktree._ok(r.top, "show-ref", "--verify", "--quiet", rv["ref"]):
             worktree.git(r.top, "update-ref", "-d", rv["ref"])
     return "removed the snapshot worktree %s and %s; the review record stays in %s" % (rv["worktree"], rv["ref"],
