@@ -1,4 +1,5 @@
 """Job control (spec 7): status, result and cancel for the jobs of a store, and the detached background worker."""
+import contextlib
 import datetime as dt
 import json
 import os
@@ -187,7 +188,8 @@ def cancel(store, job_id=None, wait=CANCEL_WAIT):
     if not agy.owns(job.status().get("controller")):
         stuck = _stop_orphans(job, s.get("state"))
         if isinstance(stuck, tuple):
-            os.unlink(job.path("cancel.request"))  # it must not cancel a later rerun of a finished job
+            with contextlib.suppress(FileNotFoundError):  # a concurrent cancel may have removed it
+                os.unlink(job.path("cancel.request"))  # it must not cancel a later rerun of a finished job
             return "finished before cancel (%s)" % stuck[1], 0
         if stuck:
             return "still stopping (pid %s)" % stuck, 25
@@ -218,14 +220,14 @@ def start(job_id, prompt, **kw):
     return job.id
 
 
-def _record_setup_failure(job, identity, finding):
+def _record_setup_failure(job, identity, finding, code):
     """Mark the job fatal, but only while it is still the queued request this worker was started for and nothing else
     holds it; a job another process is running or a newer version of the job is left alone."""
     try:
         with st.flock(job.lock_path, blocking=False):
             if _request(job).get("identity") == identity and job.status().get("state") == "queued" \
                     and not agy.owns(job.status().get("controller")):
-                job.set_status(state="fatal", findings=[finding], code=2)
+                job.set_status(state="fatal", findings=[finding], code=code)
     except st.Busy:
         pass
 
@@ -236,13 +238,11 @@ def work(store, job_id):
     identity = _request(job).get("identity")
     try:
         runner.call(**st.read_json(job.path("background.json")))
-    except AgyCallError as e:
-        print("agy-call worker: %s" % e, flush=True)
-        return e.code
-    except Exception as e:  # setup failed before the runner recorded anything, e.g. a schema file that has gone
-        finding = "%s: %s" % (type(e).__name__, e)
+    except Exception as e:  # a start failure leaves the job queued: a schema file that has gone or changed
+        code = e.code if isinstance(e, AgyCallError) else 2
+        finding = str(e) if isinstance(e, AgyCallError) else "%s: %s" % (type(e).__name__, e)
         print("agy-call worker: %s" % finding, flush=True)
-        _record_setup_failure(job, identity, finding)
-        return 2
+        _record_setup_failure(job, identity, finding, code)  # does nothing once the runner has taken the job on
+        return code
     print("agy-call worker: done", flush=True)
     return 0

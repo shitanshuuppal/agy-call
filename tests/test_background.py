@@ -127,3 +127,15 @@ def test_background_run_resolves_a_relative_agy_path_for_the_worker(tmp_path, fa
     job = store.Job(str(tmp_path / "s"), "j1")
     wait_for(lambda: job.status().get("state") in ("done", "fatal"))
     assert job.status()["state"] == "done" and len(launches()) == 1
+
+
+def test_worker_records_a_changed_schema_as_fatal(tmp_path, fake):
+    set_turns, launches = fake
+    schema = tmp_path / "schema.json"
+    schema.write_text(json.dumps({"type": "object"}))
+    job = runner.enqueue("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), schema=str(schema))
+    schema.write_text(json.dumps({"type": "object", "required": ["a"]}))  # another valid schema: a different request
+    assert control.work(job.store, "j1") == 24
+    s = job.status()
+    assert s["state"] == "fatal" and s["code"] == 24 and s["findings"]
+    assert control.result(job.store, "j1")[1] == 24 and launches() == []
