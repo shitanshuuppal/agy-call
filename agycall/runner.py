@@ -504,7 +504,7 @@ def enqueue(job_id, prompt, *, max_turns=4, ignore_quota=False, fresh=False, new
                 ignore_quota=ignore_quota, fresh=fresh,
                 new_version=False)  # _admit archives the old version below
     if "require" in kw:
-        args["require"] = sorted(kw["require"] or [])
+        args["require"] = c.cident["require"]  # the list _prepare made; the caller's iterable is already consumed
     try:
         json.dumps(args)
     except TypeError as e:

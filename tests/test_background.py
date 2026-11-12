@@ -95,3 +95,11 @@ def test_enqueue_normalises_require_and_refuses_unserialisable_arguments(tmp_pat
     with pytest.raises(ValueError, match="serial"):
         runner.enqueue("j2", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), max_turns=object())
     assert not os.path.exists(os.path.join(S(tmp_path), "j2"))
+
+
+def test_enqueue_stores_the_prepared_require_list_for_an_iterator(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply('{"answer": "B"}'))
+    job = runner.enqueue("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), require=iter(["answer"]))
+    assert store.read_json(job.path("background.json"))["require"] == ["answer"]
+    assert control.work(job.store, "j1") == 0 and job.status()["state"] == "done"
