@@ -6,12 +6,13 @@ import glob
 import hashlib
 import json
 import os
+import re
 import time
 import types
 
 from . import agy, checks, classify, quota
 from . import store as st
-from .errors import Cancelled, CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
+from .errors import Blocked, Cancelled, CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
 
 RETRY_WAIT = 30
 FIX = ("Your last reply could not be used. Problems: {findings}. "
@@ -26,6 +27,14 @@ AGY_ERRORS = ("reply-with-error", "output-limit")  # a reply that came with an a
 CANCELLED = "cancelled by request"
 FIX_TASK = ("The check of your work failed. Fix the files in the worktree so that it passes, keep the work you already "
             "did, and end with the same short summary. What the check reported:\n\n{findings}")
+NEED_ONLY = ("Some of the commands you tried were refused. Reply only with one line `NEED: <command>` for each command "
+             "you tried that was refused; do not run anything or change any file.")
+SUMMARY_ONLY = ("Your last turn ended without a reply. Do not change any more files; reply only with the final summary "
+                "of at most 15 lines: files changed, checks run and their results, anything not done.")
+NEED = re.compile(r"^[ \t]*NEED:.*$", re.MULTILINE)
+TASK_STOPS = ("failed", "blocked", "interrupted")  # a task segment that ended this way sends nothing more on a rerun
+INTERRUPTED = ("the process running this task stopped before agy's output was complete, and nothing was resent; "
+               "agy-call result shows the worktree's changes; continue with task --continue")
 
 
 @dataclasses.dataclass
@@ -128,6 +137,10 @@ def _next(prompt, last, launch, fix=FIX):
         return RESTART, "restart"
     if outcome == "denied":
         return DENIED, "denied"
+    if outcome == "need":
+        return NEED_ONLY, "need"
+    if outcome == "summary":
+        return SUMMARY_ONLY, "summary"
     msg = fix.format(findings="; ".join(last.get("findings") or ["the reply was not usable"]))
     if last.get("lostContext"):
         msg += LOST.format(prompt=prompt)
@@ -217,6 +230,15 @@ def _atts(c):
     return [a for a in atts if (st.read_json(os.path.join(a, "launch.json"), {}) or {}).get("segment", 1) == c.segment]
 
 
+def _interrupt(job, att):
+    """Record an attempt that its saved output did not settle as interrupted, keeping the conversation id it saw."""
+    got = _saved_conversation(att)
+    st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "interrupted", "conversation": got, "ended": _now()})
+    job.set_status(state="interrupted")
+    if got and not job.status().get("conversation"):
+        job.set_status(conversation=got)
+
+
 def _launch(c, att, message, kind, generation):
     cmd = agy.argv(agy.path(), message, model=c.model, timeout=c.timeout, mode=c.mode, dirs=c.dirs, conversation=c.conv,
                    settings=c.settings, effort=c.effort)
@@ -294,6 +316,26 @@ def _settle(c, att, oc, recovered=False):
     if got and not c.conv:
         _hold(c, got)
     name = oc.name
+    if c.policy == "task" and name not in ("quota", "auth", "model", "malformed"):  # the task column of spec 5.2
+        need = [l.strip() for l in NEED.findall(oc.response)]
+        asked = launch.get("kind") == "need"
+        if name == "denied" and "command" in oc.denied and c.conv and not need and not asked:
+            finish(outcome="need", denied=oc.denied, findings=["agy refused a command; asking which commands it needs"])
+            return None  # spec 4.6: one turn that asks only for the NEED: lines
+        if need or asked or name == "denied":
+            earlier = [st.read_json(os.path.join(a, "result.json"), {}) or {} for a in _atts(c) if a != att]
+            kinds = sorted(set(oc.denied).union(*(r.get("denied") or [] for r in earlier)))
+            findings = need or ["agy refused a %s action and named no command it needs" % "/".join(kinds or ["tool"])]
+            finish("blocked", outcome="blocked", findings=findings, denied=kinds, need=need)
+            job.set_status(denied=kinds, need=need)
+            raise Blocked(findings, job.dir)
+        if name == "timeout":
+            give_up(["%s; the partial reply and the worktree are kept; continue with task --continue" % oc.reason])
+        if name == "empty":
+            if c.conv and launch.get("kind") != "summary":
+                finish(outcome="summary", findings=[oc.reason])  # one turn that asks only for the final summary
+                return None
+            give_up(["%s; a coding task is never resent blind; continue with task --continue" % oc.reason])
     if name == "reply" or (name in AGY_ERRORS and oc.response.strip()):
         if name != "reply":
             res["agyError"] = oc.reason
@@ -424,11 +466,10 @@ def _drive(c, max_turns, ignore_quota, fresh):
     att = pending(job)
     oc = _recovered(job, att, c.timeout) if att else None
     if att and oc is None:  # the saved output does not settle the attempt; run and batch restart the turn
-        got = _saved_conversation(att)
-        st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "interrupted", "conversation": got, "ended": _now()})
-        job.set_status(state="interrupted")
-        if got and not job.status().get("conversation"):
-            job.set_status(conversation=got)
+        _interrupt(job, att)
+        if c.policy == "task":  # a task sends no automatic turn (spec 7.4)
+            job.set_status(state="failed", findings=[INTERRUPTED])
+            raise GaveUp([INTERRUPTED], c.conv, _usage(job), job.dir)
     conv = job.status().get("conversation") or c.seed
     for a in reversed(job.launched()):  # an id can sit in a result or launch file when the status write was lost
         if conv:
@@ -465,6 +506,13 @@ def _drive(c, max_turns, ignore_quota, fresh):
             raise GaveUp(findings, c.conv, _usage(job), job.dir)
         last_res.update(outcome="rejected", findings=verdict.findings, lostContext=verdict.lost_context)
         st.write_atomic(os.path.join(done[-1], "result.json"), last_res)
+    elif c.policy == "task" and last_res.get("outcome") in TASK_STOPS:
+        findings = job.status().get("findings") or last_res.get("findings") or ["the task stopped"]
+        if last_res["outcome"] == "blocked":
+            job.set_status(state="blocked")
+            raise Blocked(findings, job.dir)
+        job.set_status(state="failed")
+        raise GaveUp(findings, c.conv, _usage(job), job.dir)
     elif last_res.get("outcome") == "failed" and (last_res.get("classified") in AGY_ERRORS or last_res.get("conversationConflict")):
         findings = last_res.get("findings") or ["agy reported an error"]  # a rerun never sends a follow-up after these stops
         job.set_status(state="failed", findings=findings)

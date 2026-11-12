@@ -3,12 +3,13 @@ import os
 import stat
 import subprocess
 import sys
+import time
 
 import pytest
 
-from agycall import control, quota, store, task, worktree
-from agycall.errors import Fatal, GaveUp, Mismatch, Quota, RepoState
-from agyturns import error_reply, git, model_error, quota_error, reply
+from agycall import agy, control, quota, runner, store, task, worktree
+from agycall.errors import Blocked, Fatal, GaveUp, Mismatch, Quota, RepoState
+from agyturns import denied, empty, error_reply, git, model_error, partial, quota_error, reply
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
@@ -223,3 +224,92 @@ def test_cli_task_hands_back_a_failed_task(repo, fake, tmp_path):
     assert r.returncode == 20, r.stderr
     assert "worktree: %s\nbranch: agy/t1\n" % _wt() in r.stdout and "?? b.txt" in r.stdout
     assert "last reply" in r.stdout and "Wrote b." in r.stdout
+
+
+def test_need_lines_block_the_task_even_when_the_check_passes(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.\nNEED: npm install left-pad\n  NEED: curl example.com", write={"b.txt": "b\n"}))
+    job = _start()
+    with pytest.raises(Blocked) as e:
+        task.drive(job)
+    assert e.value.code == 28 and "NEED: npm install left-pad" in str(e.value) and len(launches()) == 1
+    s = job.status()
+    assert s["state"] == "blocked" and s["need"] == ["NEED: npm install left-pad", "NEED: curl example.com"]
+    assert s["denied"] == [] and not os.path.exists(job.path("answer.txt")) and os.path.exists(os.path.join(_wt(), "b.txt"))
+    with pytest.raises(Blocked):  # a rerun stays blocked and launches nothing
+        task.drive(_start())
+    assert len(launches()) == 1 and control.result(job.store, "t1")[1] == 28
+
+
+def test_a_refused_command_gets_one_turn_that_asks_for_the_need_lines(repo, fake):
+    set_turns, launches = fake
+    set_turns(denied(), reply("NEED: npm test"))
+    job = _start()
+    with pytest.raises(Blocked):
+        task.drive(job)
+    second = launches()[1]
+    assert len(launches()) == 2 and second["prompt"] == runner.NEED_ONLY
+    assert second["argv"][second["argv"].index("--conversation") + 1] == "c1"
+    s = job.status()
+    assert s["state"] == "blocked" and s["need"] == ["NEED: npm test"] and s["denied"] == ["command"]
+
+
+def test_a_refused_write_blocks_at_once_and_a_command_is_asked_about_only_once(repo, fake):
+    set_turns, launches = fake
+    set_turns(denied("write_file"))
+    job = _start()
+    with pytest.raises(Blocked, match="write_file"):
+        task.drive(job)
+    assert len(launches()) == 1 and job.status()["denied"] == ["write_file"]
+    set_turns(denied())
+    with pytest.raises(Blocked, match="named no command"):
+        task.drive(_start("t2"))
+    assert len(launches()) == 3  # the refused launch and one NEED: follow-up
+
+
+def test_an_empty_reply_gets_one_summary_turn_and_is_never_resent_blind(repo, fake):
+    set_turns, launches = fake
+    set_turns(empty(conv="c1"), reply("Created b.txt.", write={"b.txt": "b\n"}))
+    assert task.drive(_start()).answer == "Created b.txt."
+    assert launches()[1]["prompt"] == runner.SUMMARY_ONLY and "--conversation" in launches()[1]["argv"]
+    set_turns(empty(conv="c2"))
+    with pytest.raises(GaveUp, match="never resent blind"):  # a second empty reply after the summary turn
+        task.drive(_start("t2"))
+    set_turns(empty())
+    with pytest.raises(GaveUp, match="never resent blind"):  # no conversation to ask in
+        task.drive(_start("t3"))
+    assert len(launches()) == 5
+
+
+def test_a_timeout_fails_the_task_and_keeps_the_partial_reply(repo, fake, monkeypatch):
+    set_turns, launches = fake
+    set_turns(partial("half done"))
+    job = _start()
+    for _ in range(2):  # a rerun keeps the stop
+        with pytest.raises(GaveUp, match="partial reply"):
+            task.drive(job)
+    assert len(launches()) == 1 and open(os.path.join(job.launched()[0], "reply.txt")).read() == "half done"
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    set_turns(reply("late", write={"b.txt": "b\n"}, sleep=30))
+    t0 = time.monotonic()
+    with pytest.raises(GaveUp, match="deadline"):  # the segment's deadline stops a running turn
+        task.drive(_start("t2", deadline="2s"))
+    assert time.monotonic() - t0 < 15 and len(launches()) == 2
+
+
+def test_a_task_whose_controller_died_sends_no_automatic_turn(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("x"))
+    job = _start()
+    att = job.new_attempt()
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "q",
+                                                         "conversation": None, "generation": 0, "segment": 1,
+                                                         "started": runner._now()})
+    with open(os.path.join(att, "agy.out"), "wb") as fh:
+        fh.write(b'{"status": "SUCC')
+    for _ in range(2):
+        with pytest.raises(GaveUp, match="nothing was resent"):
+            task.drive(job)
+    assert launches() == [] and store.read_json(os.path.join(att, "result.json"))["outcome"] == "interrupted"

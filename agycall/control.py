@@ -14,7 +14,7 @@ from .errors import AgyCallError
 
 ACTIVE = ("queued", "running", "checking")
 CODES = {"done": 0, "quota": 10, "failed": 20, "check-error": 21, "no-conversation": 23,
-         "queued": 25, "running": 25, "checking": 25, "cancelled": 27}
+         "queued": 25, "running": 25, "checking": 25, "cancelled": 27, "blocked": 28}
 CANCEL_WAIT = 20  # seconds cancel waits for the job to stop
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # this checkout; the worker never uses PATH
 
