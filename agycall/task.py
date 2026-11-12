@@ -212,6 +212,24 @@ def start(job_id, text, *, model, check_cmd, allow=(), effort=None, check_timeou
     return job
 
 
+QUEUE_GRACE = 30  # seconds a queued segment is kept for a worker that is still starting
+
+
+def _release_stale(job):
+    """A queued segment can still be taken while a live controller or background worker owns the job (worker.json, written
+    by control.spawn) or while it is younger than QUEUE_GRACE seconds: refuse then. Otherwise its worker died before it
+    started; record the segment as not taken so a new continuation can replace it."""
+    n = segments(job)[-1]
+    seg = st.read_json(_segment_path(job, n))
+    age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(seg["started"])).total_seconds()
+    if agy.owns(job.status().get("controller")) or agy.owns(st.read_json(job.path("worker.json"), {})) or age < QUEUE_GRACE:
+        raise Running("a continuation is already queued for task %s; wait for it to start (or run the task "
+                      "again to recover a controller that never did)" % job.id)
+    seg.update(taken=False, released=runner._now(), releasedWhy="its worker died before it started")
+    st.write_atomic(_segment_path(job, n), seg)
+    job.set_status(state="interrupted")
+
+
 def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, background=False):
     """`agy-call task --continue` (spec 4.7): under the job lock, append a segment to a task. A turn its controller left
     unsettled is recorded as interrupted first, so its reply is never taken as the new segment's answer. The segment has
@@ -228,8 +246,7 @@ def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, b
             raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
                             % (t["worktree"], job_id))
         if job.status().get("state") == "queued":  # reserved, and drive has not taken it: it would run only the newest
-            raise Running("a continuation is already queued for task %s; wait for it to start (or run the task "
-                          "again to recover a controller that never did)" % job_id)
+            _release_stale(job)
         att = runner.pending(job)
         if att:
             runner._interrupt(job, att)

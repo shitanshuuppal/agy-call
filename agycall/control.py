@@ -241,9 +241,10 @@ def spawn(job):
     if exe:
         env["AGYCALL_AGY"] = os.path.abspath(exe)
     with open(job.path("worker.log"), "ab") as log:
-        subprocess.Popen([sys.executable, "-m", "agycall.cli", "worker", "--store", job.store, "--job", job.id],
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=job.dir, env=env,
-                         start_new_session=True)
+        proc = subprocess.Popen([sys.executable, "-m", "agycall.cli", "worker", "--store", job.store, "--job", job.id],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=job.dir, env=env,
+                                start_new_session=True)
+    st.write_atomic(job.path("worker.json"), {"pid": proc.pid, "pstart": agy.start_time(proc.pid)})  # task --continue reads it
     return job.id
 
 

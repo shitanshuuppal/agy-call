@@ -521,6 +521,43 @@ def test_a_foreground_continuation_is_reserved_until_its_drive_takes_it(repo, fa
     assert job.status()["state"] == "done"
 
 
+def _reserve_second_segment(fake):
+    """A finished first segment, then a continuation reserved by a foreground call whose drive never ran."""
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}), reply("Created d.txt.", write={"d.txt": "d\n"}))
+    job = _start()
+    bounded(lambda: task.drive(job))
+    bounded(lambda: task.continue_("t1", "Add c.txt."))  # reserved, never driven
+    seg = store.read_json(job.path("segments", "002.json"))
+    seg["started"] = "2020-01-01T00:00:00+00:00"
+    store.write_atomic(job.path("segments", "002.json"), seg)
+    return job, launches
+
+
+def _worker(job, pid, pstart):
+    store.write_atomic(job.path("worker.json"), {"pid": pid, "pstart": pstart})
+
+
+def test_a_queued_continuation_whose_worker_died_is_released(repo, fake):
+    job, launches = _reserve_second_segment(fake)
+    dead = subprocess.Popen(["true"], start_new_session=True)
+    dead.wait()
+    _worker(job, dead.pid, "gone")
+    job = bounded(lambda: task.continue_("t1", "Add d.txt."))
+    assert task.segments(job) == [1, 2, 3]
+    assert store.read_json(job.path("segments", "002.json"))["taken"] is False
+    assert bounded(lambda: task.drive(job)).answer == "Created d.txt."
+    assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add d.txt.")
+
+
+def test_a_queued_continuation_with_a_live_worker_is_still_refused(repo, fake):
+    job, launches = _reserve_second_segment(fake)
+    _worker(job, os.getpid(), agy.start_time(os.getpid()))
+    with pytest.raises(Running, match="already queued"):
+        bounded(lambda: task.continue_("t1", "Another."))
+    assert task.segments(job) == [1, 2]
+
+
 def test_a_successful_check_cannot_outlast_the_segment_deadline(repo, fake):
     set_turns, launches = fake
     set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
