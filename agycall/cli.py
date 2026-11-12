@@ -1,11 +1,11 @@
-"""agy-call run [--background] | batch | status | result | cancel. Prints the accepted answer or the report on stdout; errors on
-stderr; exit codes in SKILL.md."""
+"""agy-call run [--background] | batch | task | status | result | cancel. Prints the accepted answer or the report on
+stdout; errors on stderr; exit codes in SKILL.md."""
 import argparse
 import collections
 import json
 import sys
 
-from . import control
+from . import control, task
 from . import store as st
 from .batch import batch
 from .errors import AgyCallError, Cancelled, Quota
@@ -74,6 +74,19 @@ def _batch(a):
     return 27 if any(isinstance(v, Cancelled) for v in res.values()) else 20
 
 
+def _task(a):
+    """agy-call task: start or rerun a coding task in its own worktree (spec 4.3); prints the hand-back."""
+    if not a.job or not a.prompt_file:
+        raise ValueError("task needs --job and --prompt-file")
+    with open(a.prompt_file, encoding="utf-8") as fh:
+        text = fh.read()
+    job = task.start(a.job, text, model=a.model, check_cmd=a.check_cmd, allow=a.allow, effort=a.effort,
+                     check_timeout=a.check_timeout, timeout=a.timeout, max_turns=a.max_turns, deadline=a.deadline,
+                     new_version=a.new_version)
+    task.drive(job)
+    return control.result(job.store, job.id)
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="agy-call", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -95,6 +108,18 @@ def main(argv):
         p.add_argument("job", nargs="?")
         p.add_argument("--store")
         p.add_argument("--namespace")
+    t = sub.add_parser("task")
+    t.add_argument("--job")
+    t.add_argument("--prompt-file")
+    t.add_argument("--model")
+    t.add_argument("--effort")
+    t.add_argument("--allow", action="append", default=[])
+    t.add_argument("--check-cmd")
+    t.add_argument("--check-timeout", type=float, default=600)
+    t.add_argument("--timeout", default="60m")
+    t.add_argument("--max-turns", type=int, default=3)
+    t.add_argument("--deadline", default="2h")
+    t.add_argument("--new-version", action="store_true")
     w = sub.add_parser("worker")  # started by run --background; not for direct use
     w.add_argument("--store", required=True)
     w.add_argument("--job", required=True)
@@ -106,7 +131,10 @@ def main(argv):
             return control.work(a.store, a.job)
         if a.cmd == "run":
             return _run(a)
-        text, code = getattr(control, a.cmd)(st.store_dir(a.store, a.namespace), a.job)
+        if a.cmd == "task":
+            text, code = _task(a)
+        else:
+            text, code = getattr(control, a.cmd)(st.store_dir(a.store, a.namespace), a.job)
     except AgyCallError as e:
         print("agy-call: %s" % e, file=sys.stderr)
         return e.code

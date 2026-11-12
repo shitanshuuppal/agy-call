@@ -24,6 +24,8 @@ LOST = "\n\nThe original request was:\n\n{prompt}"
 FIRST_LIKE = ("first", "retry-first", "fresh")
 AGY_ERRORS = ("reply-with-error", "output-limit")  # a reply that came with an agy error: only a check accepts it, no follow-up
 CANCELLED = "cancelled by request"
+FIX_TASK = ("The check of your work failed. Fix the files in the worktree so that it passes, keep the work you already "
+            "did, and end with the same short summary. What the check reported:\n\n{findings}")
 
 
 @dataclasses.dataclass
@@ -116,7 +118,7 @@ def _result(job, want_json):
                   conversation=job.status().get("conversation"), attempts=len(job.launched()), usage=_usage(job), dir=job.dir)
 
 
-def _next(prompt, last, launch):
+def _next(prompt, last, launch, fix=FIX):
     if last is None:
         return prompt, "first"
     outcome = last.get("outcome")
@@ -126,7 +128,7 @@ def _next(prompt, last, launch):
         return RESTART, "restart"
     if outcome == "denied":
         return DENIED, "denied"
-    msg = FIX.format(findings="; ".join(last.get("findings") or ["the reply was not usable"]))
+    msg = fix.format(findings="; ".join(last.get("findings") or ["the reply was not usable"]))
     if last.get("lostContext"):
         msg += LOST.format(prompt=prompt)
     return msg, "fix"
@@ -207,18 +209,31 @@ def _recovered(job, att, timeout):
     return oc
 
 
+def _atts(c):
+    """The attempts the job loop looks at: all of them for run and batch, the current segment's for a task."""
+    atts = c.job.launched()
+    if not c.segment:
+        return atts
+    return [a for a in atts if (st.read_json(os.path.join(a, "launch.json"), {}) or {}).get("segment", 1) == c.segment]
+
+
 def _launch(c, att, message, kind, generation):
-    cmd = agy.argv(agy.path(), message, model=c.model, timeout=c.timeout, mode=c.mode, dirs=c.dirs, conversation=c.conv)
+    cmd = agy.argv(agy.path(), message, model=c.model, timeout=c.timeout, mode=c.mode, dirs=c.dirs, conversation=c.conv,
+                   settings=c.settings, effort=c.effort)
     launch = {"pid": None, "pgid": None, "kind": kind, "message": message, "conversation": c.conv,
               "generation": generation, "started": _now(), "argv": agy.redact(cmd)}
+    deadline = agy.seconds(c.timeout) + agy.GRACE
+    if c.segment:  # which segment and grant this launch used; the segment's deadline also bounds the turn
+        with open(c.settings, "rb") as fh:
+            launch.update(segment=c.segment, grant=c.settings, grantSha=hashlib.sha256(fh.read()).hexdigest())
+        deadline = min(deadline, max(1, (c.end - dt.datetime.now(dt.timezone.utc)).total_seconds()))
     st.write_atomic(os.path.join(att, "launch.json"), launch)
 
     def started(pid, when):
         launch.update(pid=pid, pgid=pid, pstart=when)
         st.write_atomic(os.path.join(att, "launch.json"), launch)
 
-    r = agy.run(att, cmd, cwd=c.cwd, deadline=agy.seconds(c.timeout) + agy.GRACE, fds=c.fds, on_start=started,
-                should_stop=c.should_stop)
+    r = agy.run(att, cmd, cwd=c.cwd, deadline=deadline, fds=c.fds, on_start=started, should_stop=c.should_stop)
     return classify.classify(r.exit, r.out, r.err, r.stopped)
 
 
@@ -328,7 +343,7 @@ def _settle(c, att, oc, recovered=False):
         if name == "malformed":
             reason += "; the raw output is in %s" % os.path.join(att, "agy.out")
         code = {"auth": 11, "model": 14}.get(name, 22)
-        finish("fatal", outcome="fatal", findings=[reason])
+        finish(c.fatal, outcome="fatal", findings=[reason])
         job.set_status(code=code)
         raise Fatal(code, reason)
     return None
@@ -336,8 +351,9 @@ def _settle(c, att, oc, recovered=False):
 
 def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m", cwd=None, dirs=(), mode=None,
              conversation=None, expect=None, require=None, schema=None, check_cmd=None, check_timeout=120, check=None,
-             check_id=None):
-    """Check a request before anything is written, and return the job's working state."""
+             check_id=None, settings=None, effort=None, policy="run", segment=None, end=None):
+    """Check a request before anything is written, and return the job's working state. A task (policy "task") also
+    passes its grant file (settings), its effort, its segment number and the segment's end (an aware datetime)."""
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
     size = len(prompt.encode("utf-8"))
@@ -355,7 +371,28 @@ def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout=
         checked=any(cident[k] for k in ("json", "require", "schema", "cmd")) or check is not None,
         ident=st.identity(prompt, model, cwd, dirs, conversation, cident, mode), conv=None, fds=[], stack=None)
     c.should_stop = lambda: "cancel" if _cancel_requested(job) else None
+    c.policy, c.settings, c.effort, c.segment, c.end = policy, settings, effort, segment, end
+    c.fix, c.fatal = (FIX_TASK, "setup-error") if policy == "task" else (FIX, "fatal")
     return c
+
+
+def _lock(job, stack):
+    """Take the job lock without blocking, held until stack closes (Running when another process holds it), then
+    recover what a dead controller left. Returns the lock's descriptor."""
+    try:
+        fd = stack.enter_context(st.flock(job.lock_path, blocking=False)).fileno()
+    except st.Busy:
+        raise Running("job %s is running in another process" % job.id)
+    recover(job)  # before any archive: a live child must never lose its folder
+    return fd
+
+
+def _own(c, stack):
+    """Record this process as the job's controller until stack closes. cancel reads it to know whether a live process
+    will act on cancel.request; the record is cleared before the job lock is released, because the stack unwinds in
+    reverse order."""
+    c.job.set_status(controller={"pid": os.getpid(), "pstart": agy.start_time(os.getpid())})
+    stack.callback(c.job.set_status, controller=None)
 
 
 def _admit(c, stack, new_version):
@@ -363,11 +400,7 @@ def _admit(c, stack, new_version):
     new one."""
     job = c.job
     c.stack = stack
-    try:
-        c.fds.append(stack.enter_context(st.flock(job.lock_path, blocking=False)).fileno())
-    except st.Busy:
-        raise Running("job %s is running in another process" % job.id)
-    recover(job)  # before any archive: a live child must never lose its folder
+    c.fds.append(_lock(job, stack))
     req = st.read_json(job.path("request.json"))
     if req and req.get("identity") != c.ident:
         if not new_version:
@@ -410,7 +443,7 @@ def _drive(c, max_turns, ignore_quota, fresh):
             return r
     if _cancel_requested(job):  # before any recheck or terminal-result guard: a cancelled job stays cancelled
         _cancel(c)
-    done = job.launched()
+    done = _atts(c)
     last_res = (st.read_json(os.path.join(done[-1], "result.json"), {}) or {}) if done else {}
     if last_res.get("outcome") == "check-error":  # the reply is saved: check it again before any new turn
         try:
@@ -439,10 +472,10 @@ def _drive(c, max_turns, ignore_quota, fresh):
     while True:
         if _cancel_requested(job):  # checked before every launch
             _cancel(c)
-        atts = job.launched()
+        atts = _atts(c)
         launches = [st.read_json(os.path.join(a, "launch.json"), {}) or {} for a in atts]
         results = [st.read_json(os.path.join(a, "result.json"), {}) or {} for a in atts]
-        message, kind = _next(prompt, results[-1] if results else None, launches[-1] if launches else None)
+        message, kind = _next(prompt, results[-1] if results else None, launches[-1] if launches else None, c.fix)
         if kind == "retry-first" and not c.conv and results[-1].get("outcome") == "retry" and _agy_output(atts[-1]):
             kind = "retry-needs-conversation"  # agy may have opened a conversation we never saw
         if (kind not in FIRST_LIKE) and not c.conv:
@@ -451,9 +484,16 @@ def _drive(c, max_turns, ignore_quota, fresh):
                 raise NoConversation("job %s needs a follow-up but no conversation id was captured; replies are in %s; "
                                      "pass fresh to start a new conversation" % (job.id, job.path("attempts")))
             message, kind = (message if kind == "retry-needs-conversation" else prompt + "\n\n" + message), "fresh"
-        turns = sum(1 for l in launches if l.get("kind") not in ("retry", "retry-first"))
-        if kind not in ("retry", "retry-first") and turns >= max_turns:
+        if c.segment:  # spec 5.3: every launch of a task segment counts, retries and follow-ups included
+            turns = len(launches)
+        else:
+            turns = sum(1 for l in launches if l.get("kind") not in ("retry", "retry-first"))
+        if (c.segment or kind not in ("retry", "retry-first")) and turns >= max_turns:
             findings = (results[-1].get("findings") if results else None) or ["turn limit reached"]
+            job.set_status(state="failed", findings=findings)
+            raise GaveUp(findings, c.conv, _usage(job), job.dir)
+        if c.end and dt.datetime.now(dt.timezone.utc) >= c.end:
+            findings = ["the segment's deadline passed at %s; continue with task --continue" % c.end.isoformat()]
             job.set_status(state="failed", findings=findings)
             raise GaveUp(findings, c.conv, _usage(job), job.dir)
         size = len(message.encode("utf-8"))
@@ -468,12 +508,12 @@ def _drive(c, max_turns, ignore_quota, fresh):
             job.set_status(state="quota")
             raise
         att = job.new_attempt()
-        job.set_status(state="running", attempts=len(atts) + 1, conversation=c.conv)
+        job.set_status(state="running", attempts=len(job.launched()) + 1, conversation=c.conv)
         try:
             oc = _launch(c, att, message, kind, generation)
         except Fatal as e:
             st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "fatal", "findings": [e.reason], "ended": _now()})
-            job.set_status(state="fatal", findings=[e.reason], code=e.code)
+            job.set_status(state=c.fatal, findings=[e.reason], code=e.code)
             raise
         r = _settle(c, att, oc)
         if r:
@@ -488,10 +528,7 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                  check_cmd=check_cmd, check_timeout=check_timeout, check=check, check_id=check_id)
     with contextlib.ExitStack() as stack:
         _admit(c, stack, new_version)
-        # cancel reads this to know whether a live process will act on cancel.request; the callback runs before the
-        # job lock is released, because the stack unwinds in reverse order
-        c.job.set_status(controller={"pid": os.getpid(), "pstart": agy.start_time(os.getpid())})
-        stack.callback(c.job.set_status, controller=None)
+        _own(c, stack)
         return _drive(c, max_turns, ignore_quota, fresh)
 
 

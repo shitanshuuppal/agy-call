@@ -93,3 +93,21 @@ def create(r, job_id):
     private(os.path.dirname(wt))
     git(r.top, "worktree", "add", "-q", "-b", br, wt, base)
     return head, base
+
+
+def handback(job):
+    """The lines `result` adds for a task (spec 4.8): the worktree, its branch and base, and what changed there."""
+    t = (st.read_json(job.path("request.json"), {}) or {}).get("task") or {}
+    lines = ["", "worktree: %s" % t.get("worktree"), "branch: %s" % t.get("branch"),
+             "base: %s at %s" % (t.get("baseBranch"), t.get("baseCommit"))]
+    gone = st.read_json(job.path("cleanup.json"))
+    if gone:
+        return lines + ["the worktree was removed by task --%s" % gone["action"]]
+    if not os.path.isdir(t.get("worktree") or ""):
+        return lines + ["the worktree is missing"]
+    merged = st.read_json(job.path("merge.json"))
+    if merged:
+        lines.append("merged into %s as %s" % (t["baseBranch"], merged["mergeCommit"]))
+    stat = git(t["worktree"], "diff", "--stat", t["baseCommit"]).splitlines()
+    return lines + ["git status --porcelain:"] + (changes(t["worktree"]) or ["(nothing uncommitted)"]) + \
+        ["git diff --stat %s:" % t["baseCommit"]] + (stat or ["(no tracked file changed)"])

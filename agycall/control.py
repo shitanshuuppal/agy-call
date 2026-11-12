@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from . import agy, runner
+from . import agy, runner, worktree
 from . import store as st
 from .errors import AgyCallError
 
@@ -120,14 +120,18 @@ def result(store, job_id=None):
     s = job.status()
     state = s.get("state")
     if state == "done" and os.path.exists(job.path("answer.txt")):
-        return runner._read(job.path("answer.txt")), 0
-    lines = ["state: %s" % _state(job)] + ["finding: %s" % f for f in s.get("findings") or []]
-    for att in reversed(job.launched()):
-        reply = runner._saved_reply(att)
-        if reply.strip():
-            lines += ["last reply (attempt %s):" % att, reply]
-            break
-    return "\n".join(lines), (s.get("code", 22) if state == "fatal" else CODES.get(state, 1))
+        text, code = runner._read(job.path("answer.txt")), 0
+    else:
+        lines = ["state: %s" % _state(job)] + ["finding: %s" % f for f in s.get("findings") or []]
+        for att in reversed(job.launched()):
+            reply = runner._saved_reply(att)
+            if reply.strip():
+                lines += ["last reply (attempt %s):" % att, reply]
+                break
+        text, code = "\n".join(lines), (s.get("code", 22) if state in ("fatal", "setup-error") else CODES.get(state, 1))
+    if _request(job).get("kind") == "task":  # the hand-back of spec 4.8
+        text = "\n".join([text.rstrip("\n")] + worktree.handback(job))
+    return text, code
 
 
 def _only_running(store):
