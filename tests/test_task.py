@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import stat
@@ -474,3 +475,30 @@ def test_a_failed_continuation_keeps_the_answer_the_cancel_request_and_the_segme
     assert os.path.exists(job.path("cancel.request")) and not os.path.exists(job.path("cancel.request.002.done"))
     assert task.segments(job) == [1] and not os.path.exists(job.path("segments", "001-answer.txt"))
     assert job.status()["state"] == "done"
+
+
+def _config_writer(content):
+    """A check command that fails the first time and then rewrites agy's shared config, as the Antigravity app does."""
+    return ("grep -q '^b$' b.txt || { printf '%%s' '%s' > \"$AGYCALL_AGY_CONFIG\"; exit 1; }" % content)
+
+
+def test_the_deny_mirror_is_rebuilt_before_every_launch_of_a_drive(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Wrote b.", write={"b.txt": "wrong\n"}), reply("Fixed b.", write={"b.txt": "b\n"}))
+    shared = json.dumps({"userSettings": {"globalPermissionGrants": {"allow": ["command(curl)"]}}})
+    job = _start(check_cmd=_config_writer(shared))
+    assert task.drive(job).answer == "Fixed b."
+    assert launches()[0]["settings"]["permissions"]["deny"] == []
+    second = launches()[1]["settings"]
+    assert second["permissions"]["deny"] == ["command(curl)"]
+    rec = store.read_json(os.path.join(job.launched()[1], "launch.json"))
+    assert rec["grantSha"] == hashlib.sha256(json.dumps(second, indent=1).encode("utf-8")).hexdigest()
+
+
+def test_a_shared_config_that_became_malformed_stops_the_next_launch(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Wrote b.", write={"b.txt": "wrong\n"}), reply("Fixed b.", write={"b.txt": "b\n"}))
+    job = _start(check_cmd=_config_writer("{not json"))
+    with pytest.raises(ValueError, match="shared grants"):
+        task.drive(job)
+    assert len(launches()) == 1 and job.status()["state"] == "setup-error"

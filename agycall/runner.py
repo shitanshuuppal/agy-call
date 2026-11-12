@@ -414,6 +414,7 @@ def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout=
         ident=st.identity(prompt, model, cwd, dirs, conversation, cident, mode), conv=None, fds=[], stack=None)
     c.should_stop = lambda: "cancel" if _cancel_requested(job) else None
     c.policy, c.settings, c.effort, c.segment, c.end = policy, settings, effort, segment, end
+    c.refresh = None  # a task sets a function that rewrites its grant file; the loop calls it before every launch
     c.fix, c.fatal = (FIX_TASK, "setup-error") if policy == "task" else (FIX, "fatal")
     return c
 
@@ -550,6 +551,12 @@ def _drive(c, max_turns, ignore_quota, fresh):
                         "rerun with --new-version and a shorter prompt" % (size, agy.MAX_PROMPT)]
             job.set_status(state="failed", findings=findings)
             raise GaveUp(findings, c.conv, _usage(job), job.dir)
+        if c.refresh:  # the shared grants can change between turns: the deny mirror is read again for each launch
+            try:
+                c.refresh()
+            except ValueError as e:
+                job.set_status(state=c.fatal, findings=[str(e)])
+                raise
         try:
             generation = quota.generation(c.key) if ignore_quota else quota.admit(c.key)
         except Quota:

@@ -244,8 +244,8 @@ def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, b
 
 def drive(job):
     """Run the latest segment of a task: in the foreground, on a rerun or in the background worker. A saved answer is
-    returned without a launch; otherwise the worktree must still exist, and the grant file is written again first, so
-    its deny mirror follows the shared config as it is now."""
+    returned without a launch; otherwise the worktree must still exist, and the runner writes the grant file again before
+    every launch, so its deny mirror follows the shared config as it is then."""
     t = (st.read_json(job.path("request.json"), {}) or {}).get("task")
     if not t:
         raise ValueError("no task %s in %s" % (job.id, job.store))
@@ -260,10 +260,9 @@ def drive(job):
         c.checker = _checker(t["check"], t["checkTimeout"], t["worktree"])
         c.stack = stack
         c.fds.append(fd)
-        if not os.path.exists(job.path("answer.txt")):
-            if not os.path.isdir(t["worktree"]):
-                raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
-                                % (t["worktree"], job.id))
-            write_grant(seg["grant"], t["worktree"], seg["allow"])
+        if not os.path.exists(job.path("answer.txt")) and not os.path.isdir(t["worktree"]):
+            raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
+                            % (t["worktree"], job.id))
+        c.refresh = lambda: write_grant(seg["grant"], t["worktree"], seg["allow"])
         runner._own(c, stack)
         return runner._drive(c, seg["maxTurns"], False, False)
