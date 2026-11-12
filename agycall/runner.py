@@ -408,6 +408,8 @@ def _drive(c, max_turns, ignore_quota, fresh):
         r = _settle(c, att, oc, recovered=True)
         if r:
             return r
+    if _cancel_requested(job):  # before any recheck or terminal-result guard: a cancelled job stays cancelled
+        _cancel(c)
     done = job.launched()
     last_res = (st.read_json(os.path.join(done[-1], "result.json"), {}) or {}) if done else {}
     if last_res.get("outcome") == "check-error":  # the reply is saved: check it again before any new turn

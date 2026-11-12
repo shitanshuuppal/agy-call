@@ -815,3 +815,32 @@ def test_cancel_request_wins_over_a_check_error(tmp_path, fake):
     assert store.read_json(os.path.join(att, "result.json"))["outcome"] == "cancelled"
     assert job.status()["state"] == "cancelled" and not os.path.exists(job.path("answer.txt"))
     assert open(os.path.join(att, "reply.txt")).read() == "x"
+
+
+def test_cancel_request_stops_a_rerun_before_the_check_error_recheck(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    set_turns(error_reply("Implemented the change.", error="stream closed unexpectedly"))
+    monkeypatch.setenv("FLAGFILE", str(tmp_path / "flag"))
+    monkeypatch.setenv("MARKER", str(tmp_path / "marker"))
+    cmd = 'test -f "$FLAGFILE" || exit 3; echo ran > "$MARKER"; exit 1'
+    with pytest.raises(CheckError):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
+    job = store.Job(S(tmp_path), "j1")
+    store.write_atomic(job.path("cancel.request"), {"requested": runner._now()})  # as an orphan cancel leaves it
+    job.set_status(state="cancelled")
+    (tmp_path / "flag").write_text("")
+    with pytest.raises(Cancelled):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
+    assert not (tmp_path / "marker").exists() and job.status()["state"] == "cancelled" and len(launches()) == 1
+
+
+def test_cancel_request_stops_a_rerun_of_a_guarded_failed_job(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(error_reply(BAD["response"]), GOOD)
+    with pytest.raises(GaveUp):
+        runner.call("j1", "q", store=S(tmp_path), model="m", expect="json")
+    job = store.Job(S(tmp_path), "j1")
+    store.write_atomic(job.path("cancel.request"), {"requested": runner._now()})
+    with pytest.raises(Cancelled):
+        runner.call("j1", "q", store=S(tmp_path), model="m", expect="json")
+    assert job.status()["state"] == "cancelled" and len(launches()) == 1
