@@ -241,6 +241,10 @@ def _check(c, att, text, res):
         return c.checker(text, cwd=c.cwd, fds=c.fds, on_start=started, should_stop=c.should_stop)
     except Cancelled:
         _cancel(c, att, res)
+    except CheckError:
+        if _cancel_requested(c.job):  # a pending cancel request wins over a check error
+            _cancel(c, att, res)
+        raise
 
 
 def _settle(c, att, oc, recovered=False):

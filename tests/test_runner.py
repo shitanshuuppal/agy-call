@@ -801,3 +801,17 @@ def test_checking_is_published_before_a_slow_start_is_recorded(tmp_path, fake, m
     cmd = "grep -q '\"state\": \"checking\"' " + shlex.quote(status)
     r = runner.call("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), check_cmd=cmd)
     assert r.answer == "x"
+
+
+def test_cancel_request_wins_over_a_check_error(tmp_path, fake):
+    set_turns, _ = fake
+    set_turns(reply("x"))
+    req = os.path.join(S(tmp_path), "j1", "cancel.request")
+    with pytest.raises(Cancelled) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd="touch %s; exit 2" % shlex.quote(req))
+    assert e.value.code == 27
+    job = store.Job(S(tmp_path), "j1")
+    att = job.launched()[0]
+    assert store.read_json(os.path.join(att, "result.json"))["outcome"] == "cancelled"
+    assert job.status()["state"] == "cancelled" and not os.path.exists(job.path("answer.txt"))
+    assert open(os.path.join(att, "reply.txt")).read() == "x"
