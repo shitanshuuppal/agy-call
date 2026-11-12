@@ -135,6 +135,11 @@ The first grant's SHA-256 is part of the job identity, and the same grant file i
 Adding `--allow` entries on `--continue` writes `grant-<n+1>.json`, recorded in that segment (4.7); each launch records which grant it used.
 An `--allow` entry must be a non-empty string without newlines or parentheses; agy-call does not otherwise interpret it.
 
+The grant also has a `deny` list, because agy adds the Antigravity app's global grants to every `--settings` run (measured in 10.4).
+agy-call reads `userSettings.globalPermissionGrants.allow` from `~/.gemini/config/config.json` (a missing file or key means none) and puts every entry that is not exactly one of the grant's own allow entries into `permissions.deny`; agy checks deny before allow, so those shared grants do not reach the job.
+A shared entry that is a prefix of one of the job's own commands (for example a shared `command(git)` against the job's `command(git status)`) then also blocks the job's command; the job is refused on the safe side and the user sees it.
+A deny-rule refusal does not end the run and is not listed in `denied_actions`: agy reports "Matches user-configured deny rule" to Gemini, which continues, so the `NEED:` instruction (4.4) is what surfaces it.
+
 ### 4.3 Starting a task
 
 `agy-call task --job ID --model M [--effort E] [--allow CMD]... --check-cmd CMD [--check-timeout S] [--max-turns N] [--deadline T] [--background] --prompt-file F`, run from inside the repository.
@@ -446,6 +451,15 @@ Release requires all of these to pass:
 - on a resumed conversation (`--conversation`), the same grant applies and nothing outside it is allowed;
 - the command-matching results are recorded, and the grant construction in 4.2 is adjusted to them (for example, telling Gemini to run commands one at a time if compound commands do not match).
 If either of the first two fails, release is blocked until the design is revised.
+
+Results measured on agy 1.5.6 with Gemini 3.8 Flash on 2026-11-12, before step 3 was built:
+- `~/.gemini/config/config.json` holds the Antigravity app's `userSettings.globalPermissionGrants.allow`, and those grants are added to a `--settings` run: with only `command(date)` granted, `gcloud run --help` ran because the shared list allows `command(gcloud run)`, while `gcloud version`, which no list allows, was refused. The first release condition therefore fails without a fix; 4.2 now mirrors every shared grant into the job's `deny` list.
+- A `deny` entry in `--settings` overrides a shared allow: `gcloud run --help` was refused with "Matches user-configured deny rule", the run continued, and the refusal was not in `denied_actions`.
+- On a resumed conversation the run's own `--settings` applies and nothing carries over from earlier turns: resumed with the same write grant, a write outside it was refused; resumed with no write grant, a write inside the folder the first turn could write was refused.
+- A compound command matches when each part is granted: with `command(date)` and `command(echo)`, `date && echo hi` ran in one tool call.
+- `--sandbox` does not stop a granted command from writing outside the workspace: `touch` on a path outside the working directory succeeded with and without it. The guarantee in 4.1 stays limited to agy's own file-writing tool.
+- Gemini in headless agy did not call a URL tool even with `read_url(github.com)` granted, so URL grants could not be measured and play no part in task grants.
+The release check after step 3 repeats the first two measurements with the deny mirror in place.
 
 ## 11. Migration
 
