@@ -458,6 +458,15 @@ def test_model_is_required(tmp_path, fake):
     assert launches() == []
 
 
+@pytest.mark.parametrize("kw", [{"mode": object()}, {"conversation": 123}])
+def test_non_text_mode_or_conversation_is_refused_before_anything_is_written(tmp_path, fake, kw):
+    set_turns, launches = fake
+    for fn in (runner.call, runner.enqueue):
+        with pytest.raises(ValueError, match="must be text"):
+            fn("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), **kw)
+    assert launches() == [] and not os.path.exists(os.path.join(S(tmp_path), "j1"))
+
+
 def test_invalid_schema_launches_nothing(tmp_path, fake):
     set_turns, launches = fake
     schema = tmp_path / "s.json"

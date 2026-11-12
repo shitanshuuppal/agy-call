@@ -412,6 +412,9 @@ def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout=
     (an aware datetime); a review also passes the schema file that agy gets with --json-schema."""
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
+    for name, value in (("mode", mode), ("conversation", conversation)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError("%s must be text or None, but it is %s" % (name, type(value).__name__))
     size = len(prompt.encode("utf-8"))
     job = st.Job(st.store_dir(store, namespace), job_id)
     if size > agy.MAX_PROMPT and not os.path.exists(job.path("answer.txt")):  # a saved answer is still returned
