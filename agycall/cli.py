@@ -1,4 +1,4 @@
-"""agy-call run | batch | status | result | cancel. Prints the accepted answer or the report on stdout; errors on
+"""agy-call run [--background] | batch | status | result | cancel. Prints the accepted answer or the report on stdout; errors on
 stderr; exit codes in SKILL.md."""
 import argparse
 import collections
@@ -44,7 +44,11 @@ def _run(a):
             prompt = fh.read()
     else:
         prompt = sys.stdin.read()
-    res = call(a.job, prompt, conversation=a.conversation, new_version=a.new_version, **_opts(a))
+    kw = dict(conversation=a.conversation, new_version=a.new_version, **_opts(a))
+    if a.background:
+        print(control.start(a.job, prompt, **kw))
+        return 0
+    res = call(a.job, prompt, **kw)
     sys.stdout.write(res.text if res.text.endswith("\n") else res.text + "\n")
     return 0
 
@@ -78,6 +82,7 @@ def main(argv):
     src.add_argument("--prompt")
     r.add_argument("--conversation")
     r.add_argument("--new-version", action="store_true")
+    r.add_argument("--background", action="store_true")
     _common(r)
     b = sub.add_parser("batch")
     b.add_argument("jobs_file")
@@ -88,10 +93,15 @@ def main(argv):
         p.add_argument("job", nargs="?")
         p.add_argument("--store")
         p.add_argument("--namespace")
+    w = sub.add_parser("worker")  # started by run --background; not for direct use
+    w.add_argument("--store", required=True)
+    w.add_argument("--job", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "batch":
         return _batch(a)
     try:
+        if a.cmd == "worker":
+            return control.work(a.store, a.job)
         if a.cmd == "run":
             return _run(a)
         text, code = getattr(control, a.cmd)(st.store_dir(a.store, a.namespace), a.job)
@@ -103,3 +113,7 @@ def main(argv):
         return 2
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

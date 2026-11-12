@@ -491,3 +491,20 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
         c.job.set_status(controller={"pid": os.getpid(), "pstart": agy.start_time(os.getpid())})
         stack.callback(c.job.set_status, controller=None)
         return _drive(c, max_turns, ignore_quota, fresh)
+
+
+def enqueue(job_id, prompt, *, max_turns=4, ignore_quota=False, fresh=False, new_version=False, **kw):
+    """Check a run exactly as call() does, record it as queued and save the arguments a background worker passes to
+    call(); kw takes call()'s other keyword arguments. Returns the job."""
+    if kw.get("check") is not None:
+        raise ValueError("a Python check function cannot run in the background; use check_cmd, expect, require or schema")
+    c = _prepare(job_id, prompt, **kw)
+    with contextlib.ExitStack() as stack:
+        _admit(c, stack, new_version)
+        args = dict(kw, job_id=job_id, prompt=prompt, store=c.job.store, namespace=None, cwd=c.cwd, dirs=c.dirs,
+                    schema=os.path.abspath(kw["schema"]) if kw.get("schema") else None, max_turns=max_turns,
+                    ignore_quota=ignore_quota, fresh=fresh,
+                    new_version=False)  # _admit has archived the old version already
+        st.write_atomic(c.job.path("background.json"), args)
+        c.job.set_status(state="queued")
+    return c.job

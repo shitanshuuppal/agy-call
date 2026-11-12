@@ -1,16 +1,20 @@
-"""Job control (spec 7.3): status, result and cancel for the jobs of a store."""
+"""Job control (spec 7): status, result and cancel for the jobs of a store, and the detached background worker."""
 import datetime as dt
 import json
 import os
+import subprocess
+import sys
 import time
 
 from . import agy, runner
 from . import store as st
+from .errors import AgyCallError
 
 ACTIVE = ("queued", "running", "checking")
 CODES = {"done": 0, "quota": 10, "failed": 20, "check-error": 21, "no-conversation": 23,
          "queued": 25, "running": 25, "checking": 25, "cancelled": 27}
 CANCEL_WAIT = 20  # seconds cancel waits for the job to stop
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # this checkout; the worker never uses PATH
 
 
 def _job(store, job_id):
@@ -172,3 +176,26 @@ def cancel(store, job_id=None, wait=CANCEL_WAIT):
             procs = live(job)
             return "still stopping (pid %s)" % ((procs[-1][1] if procs else None) or "unknown"), 25
         time.sleep(0.2)
+
+
+def start(job_id, prompt, **kw):
+    """`run --background`: record the run as queued and start a detached worker for it (spec 7.1); returns the job id."""
+    job = runner.enqueue(job_id, prompt, **kw)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (ROOT, os.environ.get("PYTHONPATH")) if p))
+    with open(job.path("worker.log"), "ab") as log:
+        subprocess.Popen([sys.executable, "-m", "agycall.cli", "worker", "--store", job.store, "--job", job.id],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=job.dir, env=env,
+                         start_new_session=True)
+    return job.id
+
+
+def work(store, job_id):
+    """The worker: run the saved request; the outcome is in status.json, and one line goes to worker.log."""
+    job = st.Job(store, job_id)
+    try:
+        runner.call(**st.read_json(job.path("background.json")))
+    except AgyCallError as e:
+        print("agy-call worker: %s" % e, flush=True)
+        return e.code
+    print("agy-call worker: done", flush=True)
+    return 0
