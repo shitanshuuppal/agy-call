@@ -519,3 +519,14 @@ def test_a_foreground_continuation_is_reserved_until_its_drive_takes_it(repo, fa
     assert task.drive(job).answer == "Created c.txt."
     assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add c.txt.")
     assert job.status()["state"] == "done"
+
+
+def test_a_successful_check_cannot_outlast_the_segment_deadline(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
+    job = _start(check_cmd="sleep 10", deadline="2s", max_turns=5)
+    t0 = time.monotonic()
+    with pytest.raises(GaveUp, match="deadline"):
+        bounded(lambda: task.drive(job))
+    assert time.monotonic() - t0 < 6 and len(launches()) == 1
+    assert job.status()["state"] == "failed" and not os.path.exists(job.path("answer.txt"))

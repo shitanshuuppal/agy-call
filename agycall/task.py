@@ -130,17 +130,34 @@ def _validate(text, wt, allow, timeout, deadline, max_turns):
                          "put the material in a file in the repository and refer to it" % (size, agy.MAX_PROMPT))
 
 
-def _checker(check_cmd, check_timeout, wt):
+def _checker(check_cmd, check_timeout, wt, end):
     """A task's check (spec 4.5): a worktree with no change fails with NO_CHANGE; otherwise the check command runs in
-    the worktree with the reply on stdin, and any exit but 0 is a finding made of the end of its output."""
+    the worktree with the reply on stdin, and any exit but 0 is a finding made of the end of its output. The command
+    runs for at most the time left in the segment; a segment whose deadline has passed before or by the check is
+    rejected, and the job loop then ends it as failed."""
+    def left():
+        return (end - dt.datetime.now(dt.timezone.utc)).total_seconds()
+
+    def late():
+        return checks.Verdict(False, None, ["the segment's deadline passed at %s while the check ran" % end.isoformat()], False)
+
     def check(text, **run):
+        if left() <= 0:
+            return late()
         try:
             changed = worktree.changes(wt)
         except RepoState as e:
             raise CheckError(str(e))
         if not changed:
             return checks.Verdict(False, None, [NO_CHANGE], False)
-        findings = checks.run_cmd(check_cmd, text, check_timeout, combined=True, **run)
+        try:
+            findings = checks.run_cmd(check_cmd, text, min(check_timeout, left()), combined=True, **run)
+        except CheckError:
+            if left() <= 0:
+                return late()
+            raise
+        if left() <= 0:
+            return late()
         return checks.Verdict(not findings, None if findings else text, findings, False)
     return check
 
@@ -259,7 +276,7 @@ def drive(job):
                             cwd=t["worktree"], check_cmd=t["check"], check_timeout=t["checkTimeout"],
                             settings=seg["grant"], effort=t["effort"], policy="task", segment=n,
                             end=dt.datetime.fromisoformat(seg["end"]))
-        c.checker = _checker(t["check"], t["checkTimeout"], t["worktree"])
+        c.checker = _checker(t["check"], t["checkTimeout"], t["worktree"], c.end)
         c.stack = stack
         c.fds.append(fd)
         if not os.path.exists(job.path("answer.txt")) and not os.path.isdir(t["worktree"]):
