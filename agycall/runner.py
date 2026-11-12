@@ -11,7 +11,7 @@ import types
 
 from . import agy, checks, classify, quota
 from . import store as st
-from .errors import CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
+from .errors import Cancelled, CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
 
 RETRY_WAIT = 30
 FIX = ("Your last reply could not be used. Problems: {findings}. "
@@ -23,6 +23,7 @@ DENIED = ("Your last tool call was denied by the permission policy. Do not repea
 LOST = "\n\nThe original request was:\n\n{prompt}"
 FIRST_LIKE = ("first", "retry-first", "fresh")
 AGY_ERRORS = ("reply-with-error", "output-limit")  # a reply that came with an agy error: only a check accepts it, no follow-up
+CANCELLED = "cancelled by request"
 
 
 @dataclasses.dataclass
@@ -60,6 +61,19 @@ def parse_usage(err_text):
             except ValueError:
                 return {}
     return {}
+
+
+def _cancel_requested(job):
+    return os.path.exists(job.path("cancel.request"))
+
+
+def _cancel(c, att=None, res=None):
+    """Stop the job for a cancel request: record it as the attempt's outcome when there is one, set state cancelled,
+    raise Cancelled. Saved replies stay where they are."""
+    if att is not None:
+        st.write_atomic(os.path.join(att, "result.json"), dict(res or {}, outcome="cancelled", findings=[CANCELLED]))
+    c.job.set_status(state="cancelled", findings=[CANCELLED])
+    raise Cancelled("job %s was cancelled; its attempts are kept in %s" % (c.job.id, c.job.path("attempts")))
 
 
 def pending(job):
@@ -175,7 +189,9 @@ def _recovered(job, att, timeout):
             out = fh.read()
     except OSError:  # the old attempt layout, or a crash before agy started: nothing to classify
         return None
-    if classify.envelope(out) is not None:
+    if _cancel_requested(job):
+        stopped = "cancel"
+    elif classify.envelope(out) is not None:
         stopped = None
     else:
         started = (st.read_json(os.path.join(att, "launch.json"), {}) or {}).get("started")
@@ -201,7 +217,8 @@ def _launch(c, att, message, kind, generation):
         launch.update(pid=pid, pgid=pid, pstart=when)
         st.write_atomic(os.path.join(att, "launch.json"), launch)
 
-    r = agy.run(att, cmd, cwd=c.cwd, deadline=agy.seconds(c.timeout) + agy.GRACE, fds=c.fds, on_start=started)
+    r = agy.run(att, cmd, cwd=c.cwd, deadline=agy.seconds(c.timeout) + agy.GRACE, fds=c.fds, on_start=started,
+                should_stop=c.should_stop)
     return classify.classify(r.exit, r.out, r.err, r.stopped)
 
 
@@ -212,14 +229,17 @@ def _hold(c, conv):
     c.job.set_status(conversation=conv)
 
 
-def _check(c, att, text):
-    """Run the caller's check on a reply in the job's cwd; a check command records its process in check.json and the
-    job shows `checking` while it runs."""
+def _check(c, att, text, res):
+    """Run the caller's check on a reply in the job's cwd; a check command records its process in check.json, the job
+    shows `checking` while it runs, and a cancel request stops it and is recorded in res."""
     def started(pid, when):
         st.write_atomic(os.path.join(att, "check.json"), {"pid": pid, "pgid": pid, "pstart": when, "started": _now()})
         c.job.set_status(state="checking")
 
-    return c.checker(text, cwd=c.cwd, fds=c.fds, on_start=started)
+    try:
+        return c.checker(text, cwd=c.cwd, fds=c.fds, on_start=started, should_stop=c.should_stop)
+    except Cancelled:
+        _cancel(c, att, res)
 
 
 def _settle(c, att, oc, recovered=False):
@@ -245,6 +265,8 @@ def _settle(c, att, oc, recovered=False):
         finish("failed", outcome="failed", findings=findings)
         raise GaveUp(findings, c.conv, _usage(job), job.dir)
 
+    if oc.name == "cancelled":
+        _cancel(c, att, res)
     resumed = launch.get("conversation")
     if got and resumed and got != resumed:  # spec 7.2: a turn answered in another conversation stops the job
         res["conversationConflict"] = got
@@ -259,11 +281,13 @@ def _settle(c, att, oc, recovered=False):
                 give_up(["%s; the reply is saved in %s and is accepted after an agy error only by a check you ask for"
                          % (oc.reason, os.path.join(att, "reply.txt"))])
         try:
-            verdict = _check(c, att, oc.response)
+            verdict = _check(c, att, oc.response, res)
         except CheckError as e:
             finish("check-error", outcome="check-error", findings=[str(e)])
             raise
         if verdict.ok:
+            if _cancel_requested(job):  # the last cancel point: nothing is saved as done after a request
+                _cancel(c, att, res)
             st.write_atomic(job.path("answer.txt"), verdict.answer)  # the answer first: its presence means done
             finish(outcome="accepted")
             job.set_status(state="done", answer=True, conversation=c.conv, findings=[])
@@ -323,6 +347,7 @@ def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout=
         seed=conversation, checker=checker, cident=cident,
         checked=any(cident[k] for k in ("json", "require", "schema", "cmd")) or check is not None,
         ident=st.identity(prompt, model, cwd, dirs, conversation, cident, mode), conv=None, fds=[], stack=None)
+    c.should_stop = lambda: "cancel" if _cancel_requested(job) else None
     return c
 
 
@@ -380,11 +405,13 @@ def _drive(c, max_turns, ignore_quota, fresh):
     last_res = (st.read_json(os.path.join(done[-1], "result.json"), {}) or {}) if done else {}
     if last_res.get("outcome") == "check-error":  # the reply is saved: check it again before any new turn
         try:
-            verdict = _check(c, done[-1], _saved_reply(done[-1]))
+            verdict = _check(c, done[-1], _saved_reply(done[-1]), last_res)
         except CheckError as e:
             job.set_status(state="check-error", findings=[str(e)])
             raise
         if verdict.ok:
+            if _cancel_requested(job):
+                _cancel(c, done[-1], last_res)
             st.write_atomic(job.path("answer.txt"), verdict.answer)
             job.set_status(state="done", answer=True, conversation=c.conv, findings=[])
             return _result(job, c.cident["json"])
@@ -401,6 +428,8 @@ def _drive(c, max_turns, ignore_quota, fresh):
         job.set_status(state="failed", findings=findings)
         raise GaveUp(findings, c.conv, _usage(job), job.dir)
     while True:
+        if _cancel_requested(job):  # checked before every launch
+            _cancel(c)
         atts = job.launched()
         launches = [st.read_json(os.path.join(a, "launch.json"), {}) or {} for a in atts]
         results = [st.read_json(os.path.join(a, "result.json"), {}) or {} for a in atts]

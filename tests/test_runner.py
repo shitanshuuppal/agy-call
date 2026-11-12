@@ -4,12 +4,13 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
 from agycall import agy, quota, runner, store
-from agycall.errors import CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
+from agycall.errors import Cancelled, CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
 from agyturns import auth_error, empty, denied, error_reply, malformed, model_error, partial, quota_error, reply, wait_for
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -719,3 +720,73 @@ def test_check_left_running_by_a_killed_controller_blocks_then_runs_again(tmp_pa
     assert r.answer == "the reply" and len(launches()) == 1
     res = store.read_json(os.path.join(job.launched()[0], "result.json"))
     assert res["recovered"] is True and res["outcome"] == "accepted"
+
+
+def _request_cancel(job):
+    store.write_atomic(job.path("cancel.request"), "{}")
+    return True
+
+
+def test_cancel_request_stops_a_running_turn(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    set_turns(reply("late", sleep=30))
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    job = store.Job(S(tmp_path), "j1")
+    threading.Thread(target=lambda: wait_for(launches) and _request_cancel(job), daemon=True).start()
+    t0 = time.monotonic()
+    with pytest.raises(Cancelled) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m")
+    assert e.value.code == 27 and time.monotonic() - t0 < 20
+    att = job.launched()[0]
+    res = store.read_json(os.path.join(att, "result.json"))
+    assert res["classified"] == "cancelled" and res["outcome"] == "cancelled" and job.status()["state"] == "cancelled"
+    assert not agy.alive(store.read_json(os.path.join(att, "launch.json"))["pgid"])
+
+
+def test_cancelled_job_stays_cancelled_and_launches_nothing(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(GOOD)
+    job = store.Job(S(tmp_path), "j1")
+    _request_cancel(job)
+    for _ in range(2):
+        with pytest.raises(Cancelled):
+            runner.call("j1", "q", store=S(tmp_path), model="m")
+    assert launches() == [] and job.status()["state"] == "cancelled"
+
+
+def test_cancel_during_the_check_stops_it(tmp_path, fake, monkeypatch):
+    set_turns, _ = fake
+    set_turns(reply("x"))
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    job = store.Job(S(tmp_path), "j1")
+    checking = lambda: job.launched() and os.path.exists(os.path.join(job.launched()[0], "check.json"))
+    threading.Thread(target=lambda: wait_for(checking) and _request_cancel(job), daemon=True).start()
+    with pytest.raises(Cancelled):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd="sleep 30")
+    att = job.launched()[0]
+    assert store.read_json(os.path.join(att, "result.json"))["outcome"] == "cancelled"
+    assert not agy.alive(store.read_json(os.path.join(att, "check.json"))["pgid"])
+    assert not os.path.exists(job.path("answer.txt")) and job.status()["state"] == "cancelled"
+
+
+def test_cancel_after_the_check_passes_saves_no_answer(tmp_path, fake):
+    set_turns, _ = fake
+    set_turns(reply("x"))
+    req = os.path.join(S(tmp_path), "j1", "cancel.request")
+    with pytest.raises(Cancelled):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd="touch " + shlex.quote(req))
+    job = store.Job(S(tmp_path), "j1")
+    assert not os.path.exists(job.path("answer.txt")) and job.status()["state"] == "cancelled"
+    assert open(os.path.join(job.launched()[0], "reply.txt")).read() == "x"  # the reply is kept
+
+
+def test_cancel_request_found_during_recovery(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(GOOD)
+    job, att = _pending(tmp_path, _env("paid reply"))
+    _request_cancel(job)
+    with pytest.raises(Cancelled):
+        runner.call("j1", "q", store=S(tmp_path), model="m")
+    res = store.read_json(os.path.join(att, "result.json"))
+    assert res["classified"] == "cancelled" and res["recovered"] is True and launches() == []
+    assert open(os.path.join(att, "reply.txt")).read() == "paid reply"
