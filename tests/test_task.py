@@ -9,7 +9,7 @@ import pytest
 
 from agycall import agy, control, quota, runner, store, task, worktree
 from agycall.errors import Blocked, Cancelled, Fatal, GaveUp, Mismatch, NoConversation, Quota, RepoState, Running
-from agyturns import denied, empty, error_reply, git, model_error, partial, quota_error, reply, wait_for
+from agyturns import bounded, denied, empty, error_reply, git, model_error, partial, quota_error, reply, wait_for
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
@@ -303,7 +303,7 @@ def test_a_task_whose_controller_died_sends_no_automatic_turn(repo, fake):
     job = _start()
     att = job.new_attempt()
     dead = subprocess.Popen(["true"])
-    dead.wait()
+    bounded(lambda: dead.wait(timeout=30), [dead.pid])
     store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "q",
                                                          "conversation": None, "generation": 0, "segment": 1,
                                                          "started": runner._now()})
@@ -382,7 +382,7 @@ def test_continue_after_the_controller_died_settles_the_old_turn_first(repo, fak
     task.continue_("t1", "Add c.txt.")
     att = job.new_attempt()  # segment 2's first turn: its controller died after agy wrote a complete reply
     dead = subprocess.Popen(["true"])
-    dead.wait()
+    bounded(lambda: dead.wait(timeout=30), [dead.pid])
     store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "m",
                                                          "conversation": "c1", "generation": 0, "segment": 2,
                                                          "started": runner._now()})
@@ -418,3 +418,26 @@ def test_a_background_task_runs_in_a_detached_worker_and_is_found_from_its_workt
     r = run_cli("status", "--all", cwd=str(tmp_path), env=env)
     assert "%s (repository %s)\n  t1  done  task  " % (job.store, worktree.repo().top) in r.stdout
     assert open(job.path("worker.log")).read().count("agy-call worker: done") == 2
+
+
+def test_a_need_follow_up_that_hit_quota_still_blocks_after_the_retry(repo, fake):
+    set_turns, launches = fake
+    set_turns(denied(), quota_error(), reply("I need nothing more.", write={"b.txt": "b\n"}))
+    job = _start()
+    with pytest.raises(Quota):
+        task.drive(job)
+    quota.clear("m", quota.generation("m"))
+    with pytest.raises(Blocked):
+        task.drive(_start())
+    assert launches()[2]["prompt"] == runner.NEED_ONLY and job.status()["state"] == "blocked"
+    assert not os.path.exists(job.path("answer.txt"))
+
+
+def test_a_refusal_that_includes_a_write_blocks_without_a_follow_up(repo, fake):
+    set_turns, launches = fake
+    resp = denied()
+    resp["denied_actions"].append({"action": "write_file", "display_name": "WriteFile"})
+    set_turns(resp)
+    with pytest.raises(Blocked, match="write_file"):
+        task.drive(_start())
+    assert len(launches()) == 1

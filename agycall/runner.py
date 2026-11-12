@@ -318,8 +318,8 @@ def _settle(c, att, oc, recovered=False):
     name = oc.name
     if c.policy == "task" and name not in ("quota", "auth", "model", "malformed"):  # the task column of spec 5.2
         need = [l.strip() for l in NEED.findall(oc.response)]
-        asked = launch.get("kind") == "need"
-        if name == "denied" and "command" in oc.denied and c.conv and not need and not asked:
+        asked = launch.get("message") == NEED_ONLY  # the message survives a retry, the kind does not
+        if name == "denied" and oc.denied == ["command"] and c.conv and not need and not asked:
             finish(outcome="need", denied=oc.denied, findings=["agy refused a command; asking which commands it needs"])
             return None  # spec 4.6: one turn that asks only for the NEED: lines
         if need or asked or name == "denied":
