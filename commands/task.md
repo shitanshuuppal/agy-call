@@ -39,7 +39,7 @@ $ARGUMENTS
 
 ## Start
 
-Use the Agent tool with `subagent_type: "agy:agy"` and give it exactly one command, with each value in single quotes.
+Use the Agent tool with `subagent_type: "agy:agy"` and give it exactly one command, with each value in single quotes (write each `'` inside a value as `'\''`); this applies to every value: the check command, each `--allow` entry and every path.
 
 A new task:
 

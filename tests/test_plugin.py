@@ -73,3 +73,8 @@ def test_the_readme_and_release_notes_give_the_new_install_line():
         text = read(path)
         assert "/plugin install agy --marketplace shitanshuuppal/agy-call" in text, path
         assert "/plugin uninstall agy-call@agy-call" in text, path
+
+
+def test_the_task_command_tells_claude_to_escape_single_quotes():
+    assert "'\\''" in read("commands", "task.md")
+    assert "'\\''" in read("skills", "agy-call", "SKILL.md")

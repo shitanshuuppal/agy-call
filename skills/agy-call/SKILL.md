@@ -67,8 +67,8 @@ agy-call task --job ID --model M [--effort E] [--allow CMD]... --check-cmd CMD [
 4. Choose `--allow` entries: the build, test, lint and read commands of this repository that the task needs, taken from its own files (README, Makefile, `package.json` scripts, `Package.swift`, `pyproject.toml`, `Cargo.toml`, CI workflows).
    Never allow a command that reaches outside the repository: network access, package installs, deletion outside the worktree, `git commit`, `git push`, or anything that reads credentials.
 5. Choose `--check-cmd`: the command that builds the repository and runs its tests, or `true`.
-6. Tell the user the `--allow` entries and the check in one or two lines, then have the `agy` subagent run `agy-call task ... --background --prompt-file FILE` with each value in single quotes.
-7. When the user asked to wait, run `until agy-call result JOB >/dev/null 2>&1; [ $? -ne 25 ]; do sleep 30; done` with the Bash tool and `run_in_background: true`, then `agy-call result JOB`; otherwise report the job id and stop.
+6. Tell the user the `--allow` entries and the check in one or two lines, then have the `agy` subagent run `agy-call task ... --background --prompt-file FILE` with each value in single quotes (write each `'` inside a value as `'\''`); this applies to every value: the check command, each `--allow` entry and every path.
+7. Unless the user asked for the task to run in the background, wait: run `until agy-call result JOB >/dev/null 2>&1; [ $? -ne 25 ]; do sleep 30; done` with the Bash tool and `run_in_background: true`, then `agy-call result JOB`; when the user asked for the background, report the job id and stop.
 
 ### What the grant allows
 
@@ -314,8 +314,10 @@ An error that is not one of these (for example a bad argument) exits with 1 or 2
 ## What to do per exit
 
 - 10: wait until the printed time and rerun the same command, or ask the user; do not use `--ignore-quota` to get around it.
-- 20: read the findings; after an output-limit stop, send a new prompt that asks for a short reply, as a new job; otherwise rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`; for a task, continue it with `task --continue`. After a stop because agy answered in another conversation, a rerun sends nothing; start a new job.
-- 21: a rerun checks the saved reply again before any new turn, but only when the request is unchanged: repair the checker's executable or environment, not the command string, schema file or `check_id`. After changing the check, the saved reply is in `attempts/NNN/reply.txt` and the raw output in `agy.out`; a rerun with `--new-version` starts a new paid job.
+- 20: read the findings; after an output-limit stop, send a new prompt that asks for a short reply, as a new job; otherwise rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`; for a task, continue it with `task --continue`.
+  After a stop because agy answered in another conversation, a rerun sends nothing; start a new job.
+- 21: a rerun checks the saved reply again before any new turn, but only when the request is unchanged: repair the checker's executable or environment, not the command string, schema file or `check_id`.
+  After changing the check, the saved reply is in `attempts/NNN/reply.txt` and the raw output in `agy.out`; a rerun with `--new-version` starts a new paid job.
 - 23: rerun with `--fresh` if starting a new conversation is acceptable; otherwise use the replies saved under `attempts/`.
 - 24: the request changed; use a new job id, or `--new-version` to replace the old job.
 - 25: another process holds the job; wait for it and rerun, which then returns its answer.
