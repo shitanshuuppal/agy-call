@@ -441,3 +441,36 @@ def test_a_refusal_that_includes_a_write_blocks_without_a_follow_up(repo, fake):
     with pytest.raises(Blocked, match="write_file"):
         task.drive(_start())
     assert len(launches()) == 1
+
+
+def test_a_second_continuation_is_refused_while_one_is_queued(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
+    job = _start(background=True)  # queued; no worker is started, so it has not taken the lock
+    with pytest.raises(Running, match="already queued"):
+        task.continue_("t1", "Something else.")
+    assert task.segments(job) == [1]
+    assert task.drive(job).answer == "Created b.txt."  # the first segment's prompt is the one that runs
+    assert launches()[0]["prompt"] == task.prompt(_wt(), [], "Add b.txt.")
+    set_turns(reply("Created c.txt.", write={"c.txt": "c\n"}))
+    queued = task.continue_("t1", "Add c.txt.", background=True)
+    with pytest.raises(Running, match="already queued"):
+        task.continue_("t1", "Another.")
+    assert task.segments(queued) == [1, 2]
+    assert task.drive(queued).answer == "Created c.txt."
+    assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add c.txt.")
+
+
+def test_a_failed_continuation_keeps_the_answer_the_cancel_request_and_the_segments(repo, fake, tmp_path):
+    set_turns, _ = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
+    job = _start()
+    task.drive(job)
+    store.write_atomic(job.path("cancel.request"), "{}")
+    (tmp_path / "agy-config.json").write_text("{not json")
+    with pytest.raises(ValueError, match="shared grants"):
+        task.continue_("t1", "Add c.txt.", allow=["make"])
+    assert open(job.path("answer.txt")).read() == "Created b.txt."
+    assert os.path.exists(job.path("cancel.request")) and not os.path.exists(job.path("cancel.request.002.done"))
+    assert task.segments(job) == [1] and not os.path.exists(job.path("segments", "001-answer.txt"))
+    assert job.status()["state"] == "done"

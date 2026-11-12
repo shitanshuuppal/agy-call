@@ -9,7 +9,7 @@ import re
 
 from . import agy, checks, runner, worktree
 from . import store as st
-from .errors import CheckError, Mismatch, NoConversation, RepoState
+from .errors import CheckError, Mismatch, NoConversation, RepoState, Running
 
 READ_ONLY = ("ls", "cat", "head", "tail", "wc", "grep", "rg", "git status", "git diff", "git log", "git show")
 PROMPT = """You are working on a coding task in the git worktree {worktree}.
@@ -209,6 +209,9 @@ def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, b
         if not os.path.isdir(t["worktree"]):
             raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
                             % (t["worktree"], job_id))
+        if job.status().get("state") == "queued":  # its worker has not started: it would run only the newest segment
+            raise Running("a continuation is already queued for task %s; wait for its worker to start (or run the "
+                          "task again to recover a worker that never did)" % job_id)
         att = runner.pending(job)
         if att:
             runner._interrupt(job, att)
@@ -220,11 +223,19 @@ def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, b
         added = [a for a in dict.fromkeys(allow) if a not in prev["allow"]]
         _validate(text, t["worktree"], prev["allow"] + added, t["timeout"], deadline, max_turns)
         grant_n = int(re.search(r"grant-(\d+)\.json$", prev["grant"]).group(1)) + (1 if added else 0)
-        if os.path.exists(job.path("answer.txt")):
-            os.replace(job.path("answer.txt"), job.path("segments", "%03d-answer.txt" % n))
-        if os.path.exists(job.path("cancel.request")):
-            os.replace(job.path("cancel.request"), job.path("cancel.request.%03d.done" % (n + 1)))
-        _write_segment(job, n + 1, text, t["worktree"], prev["allow"] + added, grant_n, max_turns, deadline)
+        grant(t["worktree"], prev["allow"] + added)  # fails on an unreadable shared config before anything moves
+        moved = []
+        for name, dest in (("answer.txt", job.path("segments", "%03d-answer.txt" % n)),
+                           ("cancel.request", job.path("cancel.request.%03d.done" % (n + 1)))):
+            if os.path.exists(job.path(name)):
+                os.replace(job.path(name), dest)
+                moved.append((dest, job.path(name)))
+        try:
+            _write_segment(job, n + 1, text, t["worktree"], prev["allow"] + added, grant_n, max_turns, deadline)
+        except BaseException:
+            for dest, src in moved:
+                os.replace(dest, src)
+            raise
         job.set_status(findings=[], need=[], denied=[])
         if background:
             _queue(job)
@@ -238,15 +249,17 @@ def drive(job):
     t = (st.read_json(job.path("request.json"), {}) or {}).get("task")
     if not t:
         raise ValueError("no task %s in %s" % (job.id, job.store))
-    n = segments(job)[-1]
-    seg = st.read_json(_segment_path(job, n))
-    c = runner._prepare(job.id, seg["prompt"], store=job.store, model=t["model"], timeout=t["timeout"],
-                        cwd=t["worktree"], check_cmd=t["check"], check_timeout=t["checkTimeout"], settings=seg["grant"],
-                        effort=t["effort"], policy="task", segment=n, end=dt.datetime.fromisoformat(seg["end"]))
-    c.checker = _checker(t["check"], t["checkTimeout"], t["worktree"])
     with contextlib.ExitStack() as stack:
+        fd = runner._lock(job, stack)
+        n = segments(job)[-1]  # chosen under the lock, so a segment added meanwhile is the one that runs
+        seg = st.read_json(_segment_path(job, n))
+        c = runner._prepare(job.id, seg["prompt"], store=job.store, model=t["model"], timeout=t["timeout"],
+                            cwd=t["worktree"], check_cmd=t["check"], check_timeout=t["checkTimeout"],
+                            settings=seg["grant"], effort=t["effort"], policy="task", segment=n,
+                            end=dt.datetime.fromisoformat(seg["end"]))
+        c.checker = _checker(t["check"], t["checkTimeout"], t["worktree"])
         c.stack = stack
-        c.fds.append(runner._lock(job, stack))
+        c.fds.append(fd)
         if not os.path.exists(job.path("answer.txt")):
             if not os.path.isdir(t["worktree"]):
                 raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
