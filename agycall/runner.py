@@ -182,11 +182,11 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
     size = len(prompt.encode("utf-8"))
     if size > agy.MAX_PROMPT:
-        raise ValueError("the prompt is %d bytes; agy takes it as one argument, so the limit is 512 KiB: "
-                         "put the material in a file under the working directory and refer to it" % size)
+        raise ValueError("the prompt is %d bytes; agy takes it as one argument, and this system's limit is %d bytes: "
+                         "put the material in a file under the working directory and refer to it" % (size, agy.MAX_PROMPT))
     agy.seconds(timeout)  # a bad timeout fails here, before any attempt folder exists
     checker, cident = checks.make_check(expect, require, schema, check_cmd, check_timeout, check, check_id)
-    checked = any(cident[k] for k in ("json", "require", "schema", "cmd", "check_id"))
+    checked = any(cident[k] for k in ("json", "require", "schema", "cmd")) or check is not None
     o = types.SimpleNamespace(model=model, timeout=timeout, mode=mode,
                               cwd=os.path.abspath(cwd or os.getcwd()), dirs=[os.path.abspath(d) for d in dirs])
     key = model
@@ -228,6 +228,12 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                 st.write_atomic(job.path("answer.txt"), verdict.answer)
                 job.set_status(state="done", answer=True, conversation=conv, findings=[])
                 return _result(job, cident["json"])
+            if last_res.get("classified") in ("reply-with-error", "output-limit"):  # same guard as in the loop: no follow-up after an agy error
+                findings = verdict.findings + ["no follow-up was sent because agy reported an error: %s" % last_res.get("agyError")]
+                last_res.update(outcome="failed", findings=findings)
+                st.write_atomic(os.path.join(done[-1], "result.json"), last_res)
+                job.set_status(state="failed", findings=findings)
+                raise GaveUp(findings, conv, _usage(job), job.dir)
             last_res.update(outcome="rejected", findings=verdict.findings, lostContext=verdict.lost_context)
             st.write_atomic(os.path.join(done[-1], "result.json"), last_res)
         while True:

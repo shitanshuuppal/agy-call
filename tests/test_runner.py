@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from agycall import quota, runner, store
+from agycall import agy, quota, runner, store
 from agycall.errors import CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
 from agyturns import auth_error, empty, denied, error_reply, malformed, model_error, partial, quota_error, reply
 
@@ -293,7 +293,7 @@ def test_noisy_stdout_is_malformed_and_kept(tmp_path, fake):
 
 def test_large_prompt_and_non_utf8_output(tmp_path, fake):
     set_turns, launches = fake
-    big = "x" * 300_000
+    big = "x" * min(300_000, agy.MAX_PROMPT)
     set_turns({"raw_hex": b'{"status": "SUCCESS", "conversation_id": "c1", "response": "ok \xff end"}'.hex()})
     r = runner.call("j1", big, store=S(tmp_path), model="m")
     assert launches()[0]["prompt"] == big
@@ -513,8 +513,31 @@ def test_attempt_files_of_the_new_layout(tmp_path, fake):
 def test_oversized_prompt_and_bad_timeout_launch_nothing(tmp_path, fake):
     set_turns, launches = fake
     set_turns(GOOD)
-    with pytest.raises(ValueError, match="512 KiB"):
-        runner.call("j1", "é" * (256 * 1024 + 1), store=S(tmp_path), model="m")  # 2 bytes each in UTF-8
+    with pytest.raises(ValueError, match="limit is"):
+        runner.call("j1", "é" * (agy.MAX_PROMPT // 2 + 1), store=S(tmp_path), model="m")  # 2 bytes each in UTF-8
     with pytest.raises(ValueError, match="timeout"):
         runner.call("j2", "q", store=S(tmp_path), model="m", timeout="ten minutes")
     assert launches() == [] and not os.path.exists(os.path.join(S(tmp_path), "j1"))
+
+
+def test_check_id_without_a_check_does_not_accept_an_error_reply(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(error_reply("Implemented the change.", error="stream closed unexpectedly"))
+    with pytest.raises(GaveUp):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_id="label-only")
+    assert len(launches()) == 1
+
+
+def test_check_error_rerun_after_an_agy_error_sends_no_follow_up(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    set_turns(error_reply("Implemented the change.", error="stream closed unexpectedly"), GOOD)
+    flag = tmp_path / "flag"
+    monkeypatch.setenv("FLAGFILE", str(flag))
+    cmd = 'test -f "$FLAGFILE" || exit 3; exit 1'
+    with pytest.raises(CheckError):
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
+    flag.write_text("")
+    with pytest.raises(GaveUp) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd=cmd)
+    assert len(launches()) == 1 and "no follow-up was sent" in str(e.value)
+    assert store.Job(S(tmp_path), "j1").status()["state"] == "failed"

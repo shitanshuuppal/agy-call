@@ -8,11 +8,12 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 
 from .errors import Fatal
 
-MAX_PROMPT = 512 * 1024  # bytes of UTF-8
+MAX_PROMPT = 131071 if sys.platform.startswith("linux") else 512 * 1024  # Linux caps one argument at 32 pages including its NUL; macOS caps only the total
 GRACE = 60               # seconds past agy's own --print-timeout before agy-call stops the run
 KILL_AFTER = 10          # seconds between SIGTERM and SIGKILL
 POLL = 1                 # seconds between checks while agy runs
