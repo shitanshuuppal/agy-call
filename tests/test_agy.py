@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import time
 
@@ -101,3 +102,43 @@ def test_failing_start_callback_stops_agy(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         agy.run(str(attempt(tmp_path)), [exe, "-x", "x"], cwd=str(tmp_path), deadline=30, on_start=boom)
     assert time.monotonic() - t0 < 10 and not agy.alive(pids[0])
+
+
+def test_cancel_stops_the_whole_process_group(tmp_path, monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    exe = script(tmp_path, "subprocess.Popen(['sleep', '30']); print('started', flush=True); time.sleep(30)")
+    att = attempt(tmp_path)
+    out = att / "agy.out"
+    pids = []
+    t0 = time.monotonic()
+    r = agy.run(str(att), [exe, "-p", "x"], cwd=str(tmp_path), deadline=60, on_start=lambda pid, when: pids.append(pid),
+                should_stop=lambda: "cancel" if out.exists() and out.read_bytes().startswith(b"started") else None)
+    assert r.stopped == "cancel" and r.exit is None and time.monotonic() - t0 < 10
+    assert r.out == b"started\n" and not agy.alive(pids[0])
+
+
+def test_no_stop_request_lets_agy_finish(tmp_path, monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    exe = script(tmp_path, "time.sleep(0.5); sys.stdout.write('done')")
+    r = agy.run(str(attempt(tmp_path)), [exe, "-p", "x"], cwd=str(tmp_path), deadline=30, should_stop=lambda: None)
+    assert r.exit == 0 and r.stopped is None and r.out == b"done"
+
+
+def test_owns_needs_the_same_pid_and_start_time():
+    me = {"pid": os.getpid(), "pstart": agy.start_time(os.getpid())}
+    assert me["pstart"] and agy.owns(me)
+    assert not agy.owns(dict(me, pstart="Thu Jan  1 00:00:00 1970"))
+    assert not agy.owns({"pid": os.getpid(), "pstart": None}) and not agy.owns(None) and not agy.owns({})
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    assert not agy.owns({"pid": dead.pid, "pstart": me["pstart"]})
+
+
+def test_stop_group_stops_a_group_that_is_not_our_child():
+    launcher = ("import subprocess; print(subprocess.Popen(['sleep', '30'], start_new_session=True, "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)")  # the sleep must not hold our pipe open
+    out = subprocess.run([sys.executable, "-c", launcher], capture_output=True, text=True, timeout=10).stdout
+    pgid = int(out)
+    assert agy.alive(pgid)
+    t0 = time.monotonic()
+    assert agy.stop_group(pgid) and not agy.alive(pgid) and time.monotonic() - t0 < 10

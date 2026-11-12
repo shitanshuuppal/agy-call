@@ -41,3 +41,7 @@ class CheckError(AgyCallError):
 
 class NoConversation(AgyCallError):
     code = 23
+
+
+class Cancelled(AgyCallError):
+    code = 27

@@ -1,5 +1,6 @@
 """Launch one agy run (spec section 6): agy's stdout and stderr go straight into the attempt folder, the prompt is one
-argument with stdin closed, and a deadline stops the whole process group, SIGTERM first and SIGKILL after KILL_AFTER."""
+argument with stdin closed, and a deadline or a cancel request stops the whole process group, SIGTERM first and SIGKILL
+after KILL_AFTER."""
 import dataclasses
 import hashlib
 import json
@@ -16,13 +17,13 @@ from .errors import Fatal
 MAX_PROMPT = 131071 if sys.platform.startswith("linux") else 512 * 1024  # Linux caps one argument at 32 pages including its NUL; macOS caps only the total
 GRACE = 60               # seconds past agy's own --print-timeout before agy-call stops the run
 KILL_AFTER = 10          # seconds between SIGTERM and SIGKILL
-POLL = 1                 # seconds between checks while agy runs
+POLL = 1                 # seconds between checks while agy or a check command runs
 
 
 @dataclasses.dataclass
 class Run:
     exit: object     # agy's exit status, negative for a signal; None when agy-call stopped it
-    stopped: object  # "deadline", or None
+    stopped: object  # "deadline" or "cancel" when agy-call stopped it, else None
     out: bytes
     err: str
 
@@ -78,24 +79,32 @@ def start_time(pid):
         return None
 
 
-def _stop(p):
-    try:
-        os.killpg(p.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    end = time.monotonic() + KILL_AFTER
-    while time.monotonic() < end:
-        p.poll()  # reap agy, or its exited leader keeps the group looking alive
-        if not alive(p.pid):
-            return
-        time.sleep(0.1)
-    try:
-        os.killpg(p.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+def owns(rec):
+    """True while the process an ownership file records (its pid and start time) is still that same process."""
+    return bool(rec and rec.get("pid") and rec.get("pstart")) and start_time(rec["pid"]) == rec["pstart"]
 
 
-def run(att, cmd, *, cwd, deadline, fds=(), on_start=None):
+def stop_group(pgid, reap=None):
+    """Stop a process group: SIGTERM, then SIGKILL after KILL_AFTER seconds. reap is called while waiting, so an exited
+    child of ours does not keep its group looking alive. True once no member is left; False if one outlived SIGKILL by
+    5 seconds."""
+    for sig, patience in ((signal.SIGTERM, KILL_AFTER), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        end = time.monotonic() + patience
+        while time.monotonic() < end:
+            if reap:
+                reap()
+            if not alive(pgid):
+                return True
+            time.sleep(0.1)
+    return False
+
+
+def run(att, cmd, *, cwd, deadline, fds=(), on_start=None, should_stop=None):
+    """Run agy until it exits, the deadline passes, or should_stop() returns "cancel" (polled every POLL seconds)."""
     with open(os.path.join(att, "agy.args"), "w", encoding="utf-8") as fh:
         json.dump(redact(cmd), fh)
     out_path, err_path = os.path.join(att, "agy.out"), os.path.join(att, "agy.err")
@@ -109,7 +118,7 @@ def run(att, cmd, *, cwd, deadline, fds=(), on_start=None):
         try:
             on_start(p.pid, start_time(p.pid))
         except BaseException:  # without a recorded pid nothing can find this agy later
-            _stop(p)
+            stop_group(p.pid, p.poll)
             p.wait()
             raise
     end = time.monotonic() + deadline
@@ -118,11 +127,16 @@ def run(att, cmd, *, cwd, deadline, fds=(), on_start=None):
             rc, stopped = p.wait(timeout=POLL), None
             break
         except subprocess.TimeoutExpired:
-            if time.monotonic() >= end:
-                _stop(p)
-                p.wait()
-                rc, stopped = None, "deadline"
-                break
+            if should_stop and should_stop() == "cancel":
+                stopped = "cancel"
+            elif time.monotonic() >= end:
+                stopped = "deadline"
+            else:
+                continue
+            stop_group(p.pid, p.poll)
+            p.wait()
+            rc = None
+            break
     with open(out_path, "rb") as fh:
         data = fh.read()
     with open(err_path, encoding="utf-8", errors="replace") as fh:

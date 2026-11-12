@@ -1,9 +1,10 @@
 import json
+import time
 
 import pytest
 
-from agycall import checks
-from agycall.errors import CheckError
+from agycall import agy, checks
+from agycall.errors import Cancelled, CheckError
 
 
 def test_extract_json_whole_fenced_and_embedded():
@@ -122,3 +123,44 @@ def test_checker_crash_becomes_check_error(tmp_path, monkeypatch):
     monkeypatch.setattr(checks, "validate", lambda *a, **k: 1 / 0)
     with pytest.raises(CheckError):
         check("{}")
+
+
+def test_check_cmd_runs_in_cwd_with_inherited_fds_and_reports_its_start(tmp_path):
+    (tmp_path / "marker").write_text("")
+    seen = []
+    with open(str(tmp_path / "lock"), "w") as lk:
+        fd = lk.fileno()
+        assert checks.run_cmd("test -f marker && test -e /dev/fd/%d" % fd, "text", 30, cwd=str(tmp_path), fds=(fd,),
+                              on_start=lambda pid, when: seen.append((pid, when))) == []
+        assert checks.run_cmd("test -e /dev/fd/%d" % fd, "text", 30) != []  # not inherited unless passed
+    assert seen[0][0] > 0 and seen[0][1]
+
+
+def test_check_cmd_that_ignores_a_large_reply_does_not_hang():
+    t0 = time.monotonic()
+    assert checks.run_cmd("exit 0", "x" * 2_000_000, 30) == []
+    assert checks.run_cmd("grep -q end", "x" * 2_000_000 + " end", 30) == []
+    assert time.monotonic() - t0 < 10
+
+
+def test_check_cmd_cancel_stops_its_process_group(monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    seen = []
+    t0 = time.monotonic()
+    with pytest.raises(Cancelled) as e:
+        checks.run_cmd("sleep 30 & sleep 30", "text", 60, on_start=lambda pid, when: seen.append(pid),
+                       should_stop=lambda: "cancel" if seen else None)
+    assert e.value.code == 27 and time.monotonic() - t0 < 10 and not agy.alive(seen[0])
+
+
+def test_make_check_passes_run_options_and_does_not_wrap_a_cancel(tmp_path, monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "marker").write_text("")
+    check, _ = checks.make_check(check_cmd="test -f marker")
+    assert check("text", cwd=str(tmp_path / "a")).ok
+    assert not check("text", cwd=str(tmp_path / "b")).ok
+    check, _ = checks.make_check(check_cmd="sleep 30")
+    with pytest.raises(Cancelled):
+        check("text", should_stop=lambda: "cancel")

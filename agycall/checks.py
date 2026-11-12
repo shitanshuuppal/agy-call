@@ -6,8 +6,11 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
+import time
 
-from .errors import CheckError
+from . import agy
+from .errors import Cancelled, CheckError
 
 FENCE = re.compile(r"```(?:json)?[ \t]*\n?([\s\S]*?)```")
 Verdict = collections.namedtuple("Verdict", "ok answer findings lost_context")
@@ -80,23 +83,48 @@ def _check_schema(s, where="$"):
         _check_schema(s["items"], where + "[]")
 
 
-def run_cmd(cmd, text, timeout):
-    try:
-        p = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, start_new_session=True)
-    except OSError as e:
-        raise CheckError("check command could not start: %s" % e)
-    try:
-        out, err = p.communicate(text, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(p.pid, signal.SIGKILL)
-        p.communicate()
-        raise CheckError("check command timed out after %ss: %s" % (timeout, cmd))
+def run_cmd(cmd, text, timeout, cwd=None, fds=(), on_start=None, should_stop=None):
+    """Run a check command in its own process group, with text on stdin and the descriptors fds inherited.
+    on_start(pid, start time) is called once it runs; should_stop() is polled every agy.POLL seconds, and "cancel" stops
+    the group and raises Cancelled. Exit 0 passes ([]), exit 1 rejects (its stdout is the finding), and any other exit,
+    a timeout or a failure to start is a CheckError."""
+    with tempfile.TemporaryFile() as inp, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        inp.write(text.encode("utf-8"))
+        inp.seek(0)  # a file, not a pipe: a command that never reads its stdin cannot block on a large reply
+        try:
+            p = subprocess.Popen(cmd, shell=True, stdin=inp, stdout=out, stderr=err, cwd=cwd, start_new_session=True,
+                                 pass_fds=tuple(fds))
+        except OSError as e:
+            raise CheckError("check command could not start: %s" % e)
+        if on_start:
+            try:
+                on_start(p.pid, agy.start_time(p.pid))
+            except BaseException:  # without a recorded pid nothing can find this command later
+                agy.stop_group(p.pid, p.poll)
+                p.wait()
+                raise
+        end = time.monotonic() + timeout
+        while True:
+            try:
+                p.wait(timeout=agy.POLL)
+                break
+            except subprocess.TimeoutExpired:
+                if should_stop and should_stop() == "cancel":
+                    agy.stop_group(p.pid, p.poll)
+                    p.wait()
+                    raise Cancelled("the check command was stopped by a cancel request")
+                if time.monotonic() >= end:
+                    os.killpg(p.pid, signal.SIGKILL)
+                    p.wait()
+                    raise CheckError("check command timed out after %ss: %s" % (timeout, cmd))
+        out.seek(0)
+        err.seek(0)
+        stdout, stderr = (f.read().decode("utf-8", "replace") for f in (out, err))
     if p.returncode == 0:
         return []
     if p.returncode == 1:
-        return [out.strip() or "the check command rejected the reply"]
-    raise CheckError("check command exited %s: %s" % (p.returncode, (err or out).strip()[-500:]))
+        return [stdout.strip() or "the check command rejected the reply"]
+    raise CheckError("check command exited %s: %s" % (p.returncode, (stderr or stdout).strip()[-500:]))
 
 
 def make_check(expect=None, require=None, schema=None, check_cmd=None, check_timeout=120, func=None, check_id=None):
@@ -111,15 +139,16 @@ def make_check(expect=None, require=None, schema=None, check_cmd=None, check_tim
         _check_schema(schema_obj)
     ident = {"json": want_json, "require": require, "schema": schema_sha, "cmd": check_cmd, "check_id": check_id}
 
-    def check(text):
+    def check(text, **run):
+        """Check one reply; run holds run_cmd's cwd, fds, on_start and should_stop for a check command."""
         try:
-            return _check(text)
-        except CheckError:
+            return _check(text, run)
+        except (CheckError, Cancelled):
             raise
         except Exception as e:
             raise CheckError("check crashed: %s: %s" % (type(e).__name__, e))
 
-    def _check(text):
+    def _check(text, run):
         if not text.strip():
             return Verdict(False, None, ["the reply was empty"], False)
         if want_json:
@@ -141,7 +170,7 @@ def make_check(expect=None, require=None, schema=None, check_cmd=None, check_tim
                 findings += validate(value, schema_obj)
         answer = json.dumps(value, ensure_ascii=False, indent=1) if want_json else text
         if not findings and check_cmd:
-            findings += run_cmd(check_cmd, answer, check_timeout)
+            findings += run_cmd(check_cmd, answer, check_timeout, **run)
         if not findings and func is not None:
             try:
                 res = func(value if want_json else text)
