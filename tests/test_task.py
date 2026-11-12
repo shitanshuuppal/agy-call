@@ -542,3 +542,25 @@ def test_the_summary_follow_up_stays_single_when_it_hits_quota_and_is_retried(re
     with pytest.raises(GaveUp, match="never resent blind"):
         bounded(lambda: task.drive(_start(max_turns=6)))
     assert [l["prompt"] == runner.SUMMARY_ONLY for l in launches()] == [False, True, True]
+
+
+def test_bounded_kills_the_new_descendants_of_a_call_that_times_out():
+    pidfile = []
+
+    def stuck():
+        p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        pidfile.append(p.pid)
+        time.sleep(60)
+
+    try:
+        with pytest.raises(AssertionError, match="did not return"):
+            bounded(stuck, timeout=1)
+        time.sleep(0.5)
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pidfile[0])], capture_output=True, text=True).stdout
+        assert state.strip() in ("", "Z")  # gone, or killed and not yet reaped by its parent (this process)
+    finally:
+        for pid in pidfile:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass

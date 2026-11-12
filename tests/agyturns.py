@@ -60,10 +60,35 @@ def wait_for(predicate, timeout=30):
     raise AssertionError("condition not met within %s seconds" % timeout)
 
 
+def _descendants():
+    """The pids of every descendant of this process, from `ps`; children in their own sessions are included."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=30).stdout
+    kids = {}
+    for line in out.splitlines():
+        pid, ppid = (int(x) for x in line.split())
+        kids.setdefault(ppid, []).append(pid)
+    found, todo = set(), [os.getpid()]
+    while todo:
+        for pid in kids.get(todo.pop(), []):
+            if pid not in found:
+                found.add(pid)
+                todo.append(pid)
+    return found
+
+
+def _kill(pid, group):
+    try:
+        (os.killpg if group else os.kill)(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def bounded(fn, pids=(), timeout=30):
     """Run fn in a daemon thread and return its result (or re-raise its exception). When it has not returned after
-    timeout seconds, kill every process group in pids (the list the test fills from on_start) and fail the test."""
+    timeout seconds, kill every process group in pids (the list the test fills from on_start) and every descendant of
+    the test process that did not exist before the call (its process group and itself), and fail the test."""
     box = {}
+    before = _descendants()
 
     def target():
         try:
@@ -76,10 +101,10 @@ def bounded(fn, pids=(), timeout=30):
     th.join(timeout)
     if th.is_alive():
         for pid in list(pids):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            _kill(pid, True)
+        for pid in _descendants() - before:
+            _kill(pid, True)
+            _kill(pid, False)
         raise AssertionError("the launcher call did not return within %s seconds; its process groups were killed" % timeout)
     if "error" in box:
         raise box["error"]
