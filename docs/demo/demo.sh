@@ -2,6 +2,7 @@
 # Real agy-call runs against the test suite's stand-in for agy, so the demo spends no Gemini quota.
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)
+export PATH="$R/bin:$PATH"  # always this checkout's agy-call, never an installed one
 W=$(mktemp -d)
 cd "$W"
 cp "$R/tests/fake_agy.py" "$W/agy" && chmod +x "$W/agy"
