@@ -23,6 +23,20 @@ agy-call sits between Claude and Gemini and handles both:
 Claude uses Gemini only when you ask for it, by a slash command or in plain words.
 The guard hook stops Claude from calling `agy` directly, so every call goes through agy-call.
 
+## How it works
+
+A coding task runs in three lanes: Claude asks, agy-call sets up the worktree and the grant and checks every turn, and Gemini only edits files inside its worktree.
+When your check fails, Gemini gets a fix turn in the same conversation; when Gemini needs a command the grant does not allow, the task stops as blocked until Claude widens the grant and continues it.
+
+![A coding task, from request to merge: Claude's request, agy-call's worktree and grant, Gemini's edits, the classifier, your check, Claude's verification and the merge](docs/diagrams/task-flow.png)
+
+Every task, review and `run` job moves through these states, and the exit code tells a script which one it ended in.
+
+![A job's states: queued, running, checking and done, with blocked, quota hold, cancelled and failed](docs/diagrams/job-states.png)
+
+A review follows the same path with a read-only snapshot instead of a worktree.
+`docs/diagrams/how-it-works.html` has both diagrams on one page.
+
 ## Commands
 
 | Slash command | What it does |
