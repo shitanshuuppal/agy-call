@@ -532,6 +532,28 @@ def test_a_successful_check_cannot_outlast_the_segment_deadline(repo, fake):
     assert job.status()["state"] == "failed" and not os.path.exists(job.path("answer.txt"))
 
 
+def test_bounded_kills_the_new_descendants_of_a_call_that_raises():
+    pidfile = []
+
+    def boom():
+        p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        pidfile.append(p.pid)
+        raise KeyError("boom")
+
+    try:
+        with pytest.raises(KeyError):
+            bounded(boom)
+        time.sleep(0.5)
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pidfile[0])], capture_output=True, text=True).stdout
+        assert state.strip() in ("", "Z")  # gone, or killed and not yet reaped by its parent (this process)
+    finally:
+        for pid in pidfile:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+
+
 def test_the_summary_follow_up_stays_single_when_it_hits_quota_and_is_retried(repo, fake):
     set_turns, launches = fake
     set_turns(empty(conv="c1"), quota_error(), empty(conv="c1"))

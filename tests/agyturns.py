@@ -86,7 +86,8 @@ def _kill(pid, group):
 def bounded(fn, pids=(), timeout=30):
     """Run fn in a daemon thread and return its result (or re-raise its exception). When it has not returned after
     timeout seconds, kill every process group in pids (the list the test fills from on_start) and every descendant of
-    the test process that did not exist before the call (its process group and itself), and fail the test."""
+    the test process that did not exist before the call (its process group and itself), and fail the test. When fn
+    raises, the same processes are killed before the exception is re-raised."""
     box = {}
     before = _descendants()
 
@@ -99,14 +100,19 @@ def bounded(fn, pids=(), timeout=30):
     th = threading.Thread(target=target, daemon=True)
     th.start()
     th.join(timeout)
-    if th.is_alive():
+
+    def cleanup():
         for pid in list(pids):
             _kill(pid, True)
         for pid in _descendants() - before:
             _kill(pid, True)
             _kill(pid, False)
+
+    if th.is_alive():
+        cleanup()
         raise AssertionError("the launcher call did not return within %s seconds; its process groups were killed" % timeout)
     if "error" in box:
+        cleanup()
         raise box["error"]
     return box.get("value")
 
