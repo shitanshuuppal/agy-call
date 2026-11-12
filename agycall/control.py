@@ -214,13 +214,31 @@ def start(job_id, prompt, **kw):
     return job.id
 
 
+def _record_setup_failure(job, identity, finding):
+    """Mark the job fatal, but only while it is still the queued request this worker was started for and nothing else
+    holds it; a job another process is running or a newer version of the job is left alone."""
+    try:
+        with st.flock(job.lock_path, blocking=False):
+            if _request(job).get("identity") == identity and job.status().get("state") == "queued" \
+                    and not agy.owns(job.status().get("controller")):
+                job.set_status(state="fatal", findings=[finding], code=2)
+    except st.Busy:
+        pass
+
+
 def work(store, job_id):
     """The worker: run the saved request; the outcome is in status.json, and one line goes to worker.log."""
     job = st.Job(store, job_id)
+    identity = _request(job).get("identity")
     try:
         runner.call(**st.read_json(job.path("background.json")))
     except AgyCallError as e:
         print("agy-call worker: %s" % e, flush=True)
         return e.code
+    except Exception as e:  # setup failed before the runner recorded anything, e.g. a schema file that has gone
+        finding = "%s: %s" % (type(e).__name__, e)
+        print("agy-call worker: %s" % finding, flush=True)
+        _record_setup_failure(job, identity, finding)
+        return 2
     print("agy-call worker: done", flush=True)
     return 0

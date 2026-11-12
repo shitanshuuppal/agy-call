@@ -103,3 +103,15 @@ def test_enqueue_stores_the_prepared_require_list_for_an_iterator(tmp_path, fake
     job = runner.enqueue("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), require=iter(["answer"]))
     assert store.read_json(job.path("background.json"))["require"] == ["answer"]
     assert control.work(job.store, "j1") == 0 and job.status()["state"] == "done"
+
+
+def test_worker_records_a_setup_failure_instead_of_leaving_the_job_queued(tmp_path, fake):
+    set_turns, launches = fake
+    schema = tmp_path / "schema.json"
+    schema.write_text(json.dumps({"type": "object"}))
+    job = runner.enqueue("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), schema=str(schema))
+    schema.unlink()  # preparation in the worker now fails before the runner records anything
+    assert control.work(job.store, "j1") == 2
+    s = job.status()
+    assert s["state"] == "fatal" and s["code"] == 2 and "schema.json" in s["findings"][0]
+    assert control.result(job.store, "j1")[1] == 2 and launches() == []
