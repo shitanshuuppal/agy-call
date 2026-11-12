@@ -486,6 +486,31 @@ def test_cleanup_after_the_snapshot_folder_was_deleted_drops_only_its_own_regist
     git(repo, "worktree", "remove", "--force", other)
 
 
+def test_a_checkout_hook_cannot_change_the_snapshot(repo, fake):
+    set_turns, launches = fake
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text("#!/bin/sh\necho hooked > a.txt\n")
+    hook.chmod(0o755)
+    _changed(repo, "a.txt")
+    set_turns(reply(_review_json(["a.txt"])))
+    job = review.start(model="m")
+    rv = _rv(job)
+    assert open(os.path.join(rv["worktree"], "a.txt")).read() == "changed a.txt\n"
+    assert review.drive(job).text and len(launches()) == 1
+
+
+def test_a_snapshot_dirtied_after_creation_is_refused_before_the_next_launch(repo, fake):
+    set_turns, launches = fake
+    _changed(repo, "a.txt")
+    set_turns(reply(_review_json(["a.txt"])))
+    job = review.start(model="m")
+    with open(os.path.join(_rv(job)["worktree"], "a.txt"), "w") as f:
+        f.write("edited\n")
+    with pytest.raises(RepoState, match="not the clean snapshot worktree"):
+        review.drive(job)
+    assert launches() == []
+
+
 def test_a_failed_foreground_review_prints_the_error_the_result_and_exits_with_its_code(repo, fake):
     set_turns, _ = fake
     _changed(repo, "a.txt")

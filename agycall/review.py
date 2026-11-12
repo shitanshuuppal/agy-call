@@ -163,7 +163,10 @@ def _snapshot(top, rv):
         worktree.git(top, "update-ref", rv["ref"], rv["snapshot"])
     if not present:
         worktree.private(os.path.dirname(rv["worktree"]))
-        worktree.git(top, "worktree", "add", "-q", "--detach", rv["worktree"], rv["snapshot"])
+        with tempfile.TemporaryDirectory() as hooks:  # an empty hooks folder: no post-checkout hook may change the files
+            worktree.git(top, "-c", "core.hooksPath=" + hooks, "worktree", "add", "-q", "--detach", rv["worktree"],
+                         rv["snapshot"])
+        _check_existing(top, rv)
 
 
 def _queue(job):
@@ -274,7 +277,12 @@ def drive(job):
         if not os.path.exists(job.path("answer.txt")) and not os.path.isdir(rv["worktree"]):
             raise RepoState("the snapshot worktree %s of review %s is missing; run the same review command again "
                             "to make it" % (rv["worktree"], job.id))
-        c.refresh = lambda: task.write_grant(rv["grant"], None, ())
+        def refresh():  # before every launch: the snapshot is still the clean worktree, and the grant follows the config
+            if not _check_existing(rv["checkout"], rv):
+                raise RepoState("the snapshot worktree %s of review %s is missing; run the same review command again "
+                                "to make it" % (rv["worktree"], job.id))
+            task.write_grant(rv["grant"], None, ())
+        c.refresh = refresh
         runner._own(c, stack)
         return runner._drive(c, rv["maxTurns"], False, False)
 
