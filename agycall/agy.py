@@ -105,7 +105,12 @@ def run(att, cmd, *, cwd, deadline, fds=(), on_start=None):
         except OSError as e:
             raise Fatal(13, "agy could not start: %s" % e)
     if on_start:
-        on_start(p.pid, start_time(p.pid))
+        try:
+            on_start(p.pid, start_time(p.pid))
+        except BaseException:  # without a recorded pid nothing can find this agy later
+            _stop(p)
+            p.wait()
+            raise
     end = time.monotonic() + deadline
     while True:
         try:

@@ -85,3 +85,19 @@ def test_unstartable_file_is_fatal_13(tmp_path):
     with pytest.raises(Fatal) as e:
         agy.run(str(attempt(tmp_path)), [str(bad), "-p", "x"], cwd=str(tmp_path), deadline=5)
     assert e.value.code == 13
+
+
+def test_failing_start_callback_stops_agy(tmp_path, monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    monkeypatch.setattr(agy, "KILL_AFTER", 1)
+    exe = script(tmp_path, "time.sleep(30)")
+    pids = []
+
+    def boom(pid, when):
+        pids.append(pid)
+        raise OSError("disk full")
+
+    t0 = time.monotonic()
+    with pytest.raises(OSError):
+        agy.run(str(attempt(tmp_path)), [exe, "-x", "x"], cwd=str(tmp_path), deadline=30, on_start=boom)
+    assert time.monotonic() - t0 < 10 and not agy.alive(pids[0])
