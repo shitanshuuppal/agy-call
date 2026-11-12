@@ -39,7 +39,7 @@ def test_background_run_finishes_in_a_detached_worker(tmp_path, fake):
     bg = store.read_json(job.path("background.json"))
     assert os.path.realpath(bg["store"]) == os.path.realpath(job.store) and bg["cwd"] == str(tmp_path)
     assert os.path.realpath(bg["schema"]) == os.path.realpath(str(tmp_path / "schema.json"))
-    assert "agy-call worker: done" in open(job.path("worker.log")).read()
+    wait_for(lambda: "agy-call worker: done" in open(job.path("worker.log")).read())
     again = runner.call("j1", "q", store=job.store, model="m", cwd=str(tmp_path), schema=str(tmp_path / "schema.json"))
     assert again.answer == {"answer": "B"} and len(launches()) == 1
 
@@ -68,7 +68,7 @@ def test_background_job_is_cancelled_through_the_cli(tmp_path, fake):
         assert r.returncode == 0 and r.stdout == "cancelled\n"
         wait_for(lambda: not agy.owns(job.status().get("controller")))  # the worker has exited
         assert run_cli("result", "j1", "--store", S(tmp_path)).returncode == 27
-        assert "was cancelled" in open(job.path("worker.log")).read()
+        wait_for(lambda: "was cancelled" in open(job.path("worker.log")).read())
     finally:
         run_cli("cancel", "j1", "--store", S(tmp_path))
 
@@ -84,3 +84,14 @@ def test_background_start_refuses_a_job_that_is_running(tmp_path, fake):
         assert r.returncode == 25 and "running" in r.stderr
     finally:
         run_cli("cancel", "j1", "--store", S(tmp_path))
+
+
+def test_enqueue_normalises_require_and_refuses_unserialisable_arguments(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply('{"answer": "B"}'))
+    job = runner.enqueue("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), require={"answer"})
+    assert store.read_json(job.path("background.json"))["require"] == ["answer"]
+    assert control.work(job.store, "j1") == 0 and job.status()["state"] == "done"
+    with pytest.raises(ValueError, match="serial"):
+        runner.enqueue("j2", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), max_turns=object())
+    assert not os.path.exists(os.path.join(S(tmp_path), "j2"))

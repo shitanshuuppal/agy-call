@@ -499,12 +499,18 @@ def enqueue(job_id, prompt, *, max_turns=4, ignore_quota=False, fresh=False, new
     if kw.get("check") is not None:
         raise ValueError("a Python check function cannot run in the background; use check_cmd, expect, require or schema")
     c = _prepare(job_id, prompt, **kw)
+    args = dict(kw, job_id=job_id, prompt=prompt, store=c.job.store, namespace=None, cwd=c.cwd, dirs=c.dirs,
+                schema=os.path.abspath(kw["schema"]) if kw.get("schema") else None, max_turns=max_turns,
+                ignore_quota=ignore_quota, fresh=fresh,
+                new_version=False)  # _admit archives the old version below
+    if "require" in kw:
+        args["require"] = sorted(kw["require"] or [])
+    try:
+        json.dumps(args)
+    except TypeError as e:
+        raise ValueError("a background run's arguments must be serialisable: %s" % e)
     with contextlib.ExitStack() as stack:
         _admit(c, stack, new_version)
-        args = dict(kw, job_id=job_id, prompt=prompt, store=c.job.store, namespace=None, cwd=c.cwd, dirs=c.dirs,
-                    schema=os.path.abspath(kw["schema"]) if kw.get("schema") else None, max_turns=max_turns,
-                    ignore_quota=ignore_quota, fresh=fresh,
-                    new_version=False)  # _admit has archived the old version already
         st.write_atomic(c.job.path("background.json"), args)
         c.job.set_status(state="queued")
     return c.job
