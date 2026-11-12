@@ -1,7 +1,7 @@
 {
-  "name": "agy-call",
-  "version": "0.1.0",
-  "description": "Route every agy (Antigravity, Gemini) call from Claude Code through one runner that saves every reply, resumes the same conversation when a reply is unusable, and stops all callers on a quota error.",
+  "name": "agy",
+  "version": "0.2.0",
+  "description": "Hand coding tasks and code reviews to Gemini through the agy (Antigravity) CLI from Claude Code, with slash commands, background jobs, a per-task permission grant in its own git worktree, and one runner that saves every reply, resumes the same conversation when a reply is unusable, and stops all callers on a quota error.",
   "author": {
     "name": "Shitanshu Uppal"
   },

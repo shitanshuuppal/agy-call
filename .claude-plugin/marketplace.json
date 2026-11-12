@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "agy-call",
-  "description": "agy-call: a safe runner for agy (Antigravity, Gemini) calls from Claude Code.",
+  "description": "agy-call: Gemini coding tasks and reviews from Claude Code through the agy (Antigravity) CLI, with a safe runner for every agy call.",
   "owner": {
     "name": "Shitanshu Uppal"
   },
   "plugins": [
     {
-      "name": "agy-call",
-      "description": "Saves every agy reply, resumes the same conversation when a reply is unusable, and stops all callers on a quota error.",
+      "name": "agy",
+      "description": "Slash commands for Gemini coding tasks in their own git worktree, reviews and adversarial reviews, with background jobs; every reply is saved, unusable replies are resumed in the same conversation, and a quota error stops all callers.",
       "source": "./",
       "category": "development",
       "keywords": ["antigravity", "agy", "gemini", "quota", "retry"]
