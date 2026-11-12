@@ -1,6 +1,5 @@
 import json
 import os
-import stat
 import subprocess
 import sys
 import time
@@ -9,39 +8,17 @@ import pytest
 
 from agycall import quota, runner, store
 from agycall.errors import CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
+from agyturns import auth_error, empty, denied, error_reply, malformed, model_error, partial, quota_error, reply
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-@pytest.fixture
-def fake(tmp_path, monkeypatch):
-    """Point agy-call at the fake delegate; returns (set_turns, launches)."""
-    exe = tmp_path / "agy-delegate"
-    exe.write_text("#!%s\n" % sys.executable + open(os.path.join(HERE, "fake_delegate.py")).read())
-    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-    monkeypatch.setenv("AGY_DELEGATE", str(exe))
-    monkeypatch.setenv("FAKE_SCENARIO", str(tmp_path / "scenario.json"))
-    monkeypatch.setenv("FAKE_STATE", str(tmp_path / "state"))
-    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "log.jsonl"))
-    monkeypatch.setenv("AGYCALL_REAL_AGY", "")  # no shim in these tests; Task 4 covers it
-    monkeypatch.setattr(runner, "RETRY_WAIT", 0)
-
-    def set_turns(*turns):
-        (tmp_path / "scenario.json").write_text(json.dumps(list(turns)))
-
-    def launches():
-        p = tmp_path / "log.jsonl"
-        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
-
-    return set_turns, launches
 
 
 def S(tmp_path):
     return str(tmp_path / "store")
 
 
-GOOD = {"rc": 0, "stdout": '```json\n{"answer": "B", "confidence": 97}\n```', "conversation": "c1"}
-BAD = {"rc": 0, "stdout": "I would choose B.", "conversation": "c1"}
+GOOD = reply('```json\n{"answer": "B", "confidence": 97}\n```')
+BAD = reply("I would choose B.")
 
 
 def test_success_then_rerun_does_not_launch(tmp_path, fake):
@@ -50,8 +27,8 @@ def test_success_then_rerun_does_not_launch(tmp_path, fake):
     r = runner.call("j1", "question?", store=S(tmp_path), model="m", expect="json", require=["answer"])
     assert r.answer == {"answer": "B", "confidence": 97} and r.conversation == "c1" and r.attempts == 1
     assert r.usage == {"output": 10, "input": 5}
-    assert launches()[0]["structured"] == "on" and "--output-format" not in launches()[0]["argv"]
-    assert launches()[0]["argv"][:2] == ["--model", "m"] and launches()[0]["prompt"] == "question?"
+    a = launches()[0]["argv"]
+    assert a[:2] == ["--model", "m"] and a[a.index("--output-format") + 1] == "json" and launches()[0]["prompt"] == "question?"
     again = runner.call("j1", "question?", store=S(tmp_path), model="m", expect="json", require=["answer"])
     assert again.answer == r.answer and len(launches()) == 1
 
@@ -65,12 +42,12 @@ def test_unreadable_then_good_resumes_same_conversation(tmp_path, fake):
     assert second["argv"][second["argv"].index("--conversation") + 1] == "c1"
     assert "could not be used" in second["prompt"] and "no JSON value" in second["prompt"]
     job = store.Job(S(tmp_path), "j1")
-    assert open(job.path("attempts", "001", "delegate.out")).read() == "I would choose B."  # nothing deleted
+    assert open(job.path("attempts", "001", "reply.txt")).read() == "I would choose B."  # nothing deleted
 
 
 def test_timeout_then_complete_answer(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 12, "stdout": "half an ans", "conversation": "c1"}, {"rc": 0, "stdout": "the complete answer", "conversation": "c1"})
+    set_turns(partial("half an ans"), reply("the complete answer"))
     r = runner.call("j1", "q", store=S(tmp_path), model="m")
     assert r.answer == "the complete answer"
     assert "from the beginning" in launches()[1]["prompt"]
@@ -78,10 +55,10 @@ def test_timeout_then_complete_answer(tmp_path, fake):
 
 def test_denied_once_then_success_and_denied_twice_fails(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 15, "conversation": "c1"}, {"rc": 0, "stdout": "ok", "conversation": "c1"})
+    set_turns(denied(), reply("ok"))
     assert runner.call("j1", "q", store=S(tmp_path), model="m").answer == "ok"
     assert "denied by the permission policy" in launches()[1]["prompt"]
-    set_turns({"rc": 15, "conversation": "c2"})
+    set_turns(denied(conv="c2"))
     with pytest.raises(GaveUp):
         runner.call("j2", "q", store=S(tmp_path), model="m")
     assert store.Job(S(tmp_path), "j2").status()["state"] == "failed"
@@ -89,14 +66,14 @@ def test_denied_once_then_success_and_denied_twice_fails(tmp_path, fake):
 
 def test_empty_is_retried_once_with_the_same_message(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 3}, {"rc": 0, "stdout": "fine", "conversation": "c1"})
+    set_turns(empty(), reply("fine"))
     assert runner.call("j1", "q", store=S(tmp_path), model="m").answer == "fine"
     assert launches()[1]["prompt"] == "q" and "--conversation" not in launches()[1]["argv"]
 
 
 def test_quota_sets_hold_and_blocks_other_jobs(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 10, "stderr": 'AGY_SIGNAL {"status":"QUOTA_EXHAUSTED","reason":"agy quota / rate limit"}\nResets in 1h12m27s\n'})
+    set_turns(quota_error("Resets in 1h12m27s"))
     with pytest.raises(Quota) as e:
         runner.call("j1", "q", store=S(tmp_path), model="m")
     left = (e.value.until - __import__("datetime").datetime.now(e.value.until.tzinfo)).total_seconds()
@@ -109,7 +86,7 @@ def test_quota_sets_hold_and_blocks_other_jobs(tmp_path, fake):
 
 def test_older_generation_success_does_not_clear_hold(tmp_path, fake):
     set_turns, _ = fake
-    set_turns({"rc": 0, "stdout": "ok", "conversation": "c1", "sleep": 1.5})
+    set_turns(reply("ok", sleep=1.5))
     p = subprocess.Popen([sys.executable, "-c",
                           "import sys; sys.path.insert(0, %r); from agycall import runner; runner.call('slow', 'q', store=%r, model='m')" % (os.path.dirname(HERE), S(tmp_path))],
                          env=dict(os.environ))
@@ -121,8 +98,8 @@ def test_older_generation_success_does_not_clear_hold(tmp_path, fake):
 
 def test_error_envelope_gets_lost_context_message(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 0, "stdout": '{"error": "missing_initial_prompt"}', "conversation": "c1"},
-              {"rc": 0, "stdout": '{"action": "revise"}', "conversation": "c1"})
+    set_turns(reply('{"error": "missing_initial_prompt"}'),
+              reply('{"action": "revise"}'))
     r = runner.call("j1", "ORIGINAL PROMPT TEXT", store=S(tmp_path), model="m", expect="json", require=["action"])
     assert r.answer == {"action": "revise"}
     assert "The original request was:" in launches()[1]["prompt"] and "ORIGINAL PROMPT TEXT" in launches()[1]["prompt"]
@@ -183,7 +160,7 @@ def test_live_child_blocks_a_new_launch(tmp_path, fake):
 
 def test_dead_child_is_marked_interrupted_and_restarted(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 0, "stdout": "full answer", "conversation": "c9"})
+    set_turns(reply("full answer", "c9"))
     dead = subprocess.Popen(["true"], start_new_session=True)
     dead.wait()
     job = store.Job(S(tmp_path), "j1")
@@ -233,7 +210,7 @@ def test_changed_request_is_refused_then_versioned(tmp_path, fake):
 
 def test_conversation_lock_makes_second_job_wait(tmp_path, fake):
     set_turns, _ = fake
-    set_turns({"rc": 0, "stdout": "ok", "conversation": "shared"})
+    set_turns(reply("ok", "shared"))
     lock = runner.conv_lock("shared")
     holder = subprocess.Popen([sys.executable, "-c",
                                "import fcntl,os,sys,time; os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True); f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(1.5)", lock],
@@ -247,7 +224,7 @@ def test_conversation_lock_makes_second_job_wait(tmp_path, fake):
 
 def test_hanging_check_is_an_operational_failure(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 0, "stdout": "x", "conversation": "c1"})
+    set_turns(reply("x"))
     with pytest.raises(CheckError):
         runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd="sleep 30", check_timeout=1)
     assert len(launches()) == 1 and store.Job(S(tmp_path), "j1").status()["state"] == "check-error"
@@ -255,7 +232,7 @@ def test_hanging_check_is_an_operational_failure(tmp_path, fake):
 
 def test_check_error_rerun_rechecks_the_saved_reply(tmp_path, fake, monkeypatch):
     set_turns, launches = fake
-    set_turns({"rc": 0, "stdout": "the reply", "conversation": "c1"})
+    set_turns(reply("the reply"))
     flag = tmp_path / "flag"
     monkeypatch.setenv("FLAGFILE", str(flag))
     cmd = 'test -f "$FLAGFILE" || exit 3'
@@ -268,7 +245,7 @@ def test_check_error_rerun_rechecks_the_saved_reply(tmp_path, fake, monkeypatch)
 
 def test_missing_conversation_id_stops_without_fresh(tmp_path, fake):
     set_turns, launches = fake
-    set_turns({"rc": 0, "stdout": "not json"}, {"rc": 0, "stdout": '{"answer": 1}'})
+    set_turns(reply("not json", None), reply('{"answer": 1}', None))
     with pytest.raises(NoConversation):
         runner.call("j1", "q", store=S(tmp_path), model="m", expect="json")
     assert len(launches()) == 1
@@ -279,19 +256,22 @@ def test_missing_conversation_id_stops_without_fresh(tmp_path, fake):
 
 def test_fatal_codes(tmp_path, fake):
     set_turns, _ = fake
-    set_turns({"rc": 14, "stderr": 'AGY_SIGNAL {"status":"MODEL_UNAVAILABLE","reason":"model not in agy models"}\n'})
+    set_turns(model_error())
     with pytest.raises(Fatal) as e:
         runner.call("j1", "q", store=S(tmp_path), model="m")
-    assert e.value.code == 14 and "model not in agy models" in e.value.reason
-    set_turns({"rc": 1, "stderr": "agy-delegate: unknown option '--zzz'\n"})
+    assert e.value.code == 14 and 'invalid --model "m"' in e.value.reason
+    set_turns(auth_error())
     with pytest.raises(Fatal) as e:
         runner.call("j2", "q", store=S(tmp_path), model="m")
-    assert e.value.code == 22
+    assert e.value.code == 11
+    set_turns(malformed())
+    with pytest.raises(Fatal) as e:
+        runner.call("j3", "q", store=S(tmp_path), model="m")
+    assert e.value.code == 22 and "not a JSON envelope" in e.value.reason
 
 
-def test_missing_delegate_is_fatal_13(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGY_DELEGATE", str(tmp_path / "nope"))
-    monkeypatch.setenv("AGYCALL_REAL_AGY", "")
+def test_missing_agy_is_fatal_13(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGYCALL_AGY", str(tmp_path / "nope"))
     with pytest.raises(Fatal) as e:
         runner.call("j1", "q", store=S(tmp_path), model="m")
     assert e.value.code == 13
@@ -300,10 +280,21 @@ def test_missing_delegate_is_fatal_13(tmp_path, monkeypatch):
     assert store.read_json(os.path.join(job.launched()[-1], "result.json"))["outcome"] == "fatal"
 
 
+def test_noisy_stdout_is_malformed_and_kept(tmp_path, fake):
+    set_turns, _ = fake
+    raw = b'Warning: update available\n{"status": "SUCCESS", "response": "paid text"}'
+    set_turns(malformed(raw=raw, stderr="", exit=0))
+    with pytest.raises(Fatal) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m")
+    att = store.Job(S(tmp_path), "j1").launched()[0]
+    assert e.value.code == 22 and os.path.join(att, "agy.out") in e.value.reason
+    assert open(os.path.join(att, "agy.out"), "rb").read() == raw
+
+
 def test_large_prompt_and_non_utf8_output(tmp_path, fake):
     set_turns, launches = fake
     big = "x" * 300_000
-    set_turns({"rc": 0, "stdout_bytes": "6f6b20ff20656e64", "conversation": "c1"})  # "ok \xff end"
+    set_turns({"raw_hex": b'{"status": "SUCCESS", "conversation_id": "c1", "response": "ok \xff end"}'.hex()})
     r = runner.call("j1", big, store=S(tmp_path), model="m")
     assert launches()[0]["prompt"] == big
     assert r.answer.startswith("ok ") and r.answer.endswith(" end")
@@ -317,13 +308,15 @@ def test_cwd_and_dirs_are_passed(tmp_path, fake):
     runner.call("j1", "q", store=S(tmp_path), model="pro", cwd=str(work), dirs=[str(work)], timeout="15m", mode="plan")
     l = launches()[0]
     assert os.path.realpath(l["cwd"]) == os.path.realpath(str(work))
-    assert l["argv"][:4] == ["--model", "pro", "--timeout", "15m"] and "--dir" in l["argv"] and l["argv"][-3:] == ["--mode", "plan", "-"]
+    a = l["argv"]
+    assert a[:4] == ["--model", "pro", "--print-timeout", "900s"] and a[a.index("--add-dir") + 1] == str(work)
+    assert a[a.index("--mode") + 1] == "plan" and a[-2:] == ["-p", "q"]
 
 
 def test_locks_outlive_a_killed_caller(tmp_path, fake):
     import signal
     set_turns, launches = fake
-    set_turns({"rc": 0, "stdout": "late", "conversation": "cX", "sleep": 4}, {"rc": 0, "stdout": "ok", "conversation": "cX"})
+    set_turns(reply("late", "cX", sleep=4), reply("ok", "cX"))
     p = subprocess.Popen([sys.executable, "-c",
                           "import sys; sys.path.insert(0, %r); from agycall import runner; runner.call('j1', 'q', store=%r, model='m', conversation='cX')" % (os.path.dirname(HERE), S(tmp_path))],
                          env=dict(os.environ))
@@ -469,36 +462,59 @@ def test_invalid_schema_launches_nothing(tmp_path, fake):
     assert launches() == []
 
 
-CUT_OFF = ("Your previous response was cut off because it exceeded the output token limit\n"
-           "Please continue from where you left off, keeping your response shorter\nRetries remaining: 3")
-
-
-def _cut_off(response):
-    """agy exited 1 with its output-limit error; its JSON envelope still holds a reply that the delegate dropped."""
-    return {"rc": 2, "conversation": "c1", "stderr": "agy exited 1\n" + CUT_OFF + "\n",
-            "agy_out": {"conversation_id": "c1", "status": "ERROR", "response": response, "error": CUT_OFF}}
-
-
-def test_output_limit_error_reply_is_checked_and_accepted(tmp_path, fake, monkeypatch):
+def test_output_limit_error_reply_is_checked_and_accepted(tmp_path, fake):
     set_turns, launches = fake
-    monkeypatch.setenv("AGYCALL_REAL_AGY", sys.executable)  # turns on the shim env, which tells the fake its attempt folder
-    set_turns(_cut_off(GOOD["stdout"]))
+    set_turns(error_reply(GOOD["response"]))
     r = runner.call("j1", "q", store=S(tmp_path), model="m", expect="json", require=["answer"])
     assert r.answer["answer"] == "B" and len(launches()) == 1
+    att = store.Job(S(tmp_path), "j1").launched()[0]
+    assert "output token limit" in store.read_json(os.path.join(att, "result.json"))["agyError"]
 
 
-def test_output_limit_error_reply_that_fails_checks_gets_a_fix_turn(tmp_path, fake, monkeypatch):
+def test_output_limit_error_reply_that_fails_checks_stops(tmp_path, fake):
     set_turns, launches = fake
-    monkeypatch.setenv("AGYCALL_REAL_AGY", sys.executable)
-    set_turns(_cut_off(BAD["stdout"]), _cut_off(GOOD["stdout"]))
-    r = runner.call("j1", "q", store=S(tmp_path), model="m", expect="json", require=["answer"])
-    assert r.answer["answer"] == "B" and "no JSON value" in launches()[1]["prompt"]
+    set_turns(error_reply(BAD["response"]), GOOD)
+    with pytest.raises(GaveUp) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m", expect="json", require=["answer"])
+    assert len(launches()) == 1 and "no follow-up was sent" in str(e.value)
 
 
-def test_output_limit_error_without_a_reply_stops_at_once(tmp_path, fake, monkeypatch):
+def test_output_limit_error_without_a_reply_stops_at_once(tmp_path, fake):
     set_turns, launches = fake
-    monkeypatch.setenv("AGYCALL_REAL_AGY", sys.executable)
-    set_turns(_cut_off(""))
+    set_turns(error_reply(""))
     with pytest.raises(GaveUp) as e:
         runner.call("j1", "q", store=S(tmp_path), model="m", max_turns=6)
     assert len(launches()) == 1 and "output token limit" in str(e.value)
+
+
+def test_reply_after_an_agy_error_needs_a_check(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(error_reply("Implemented the change.", error="stream closed unexpectedly"))
+    with pytest.raises(GaveUp) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m")
+    att = store.Job(S(tmp_path), "j1").launched()[0]
+    assert len(launches()) == 1 and "accepted after an agy error only by a check" in str(e.value)
+    assert open(os.path.join(att, "reply.txt")).read() == "Implemented the change."
+    assert store.Job(S(tmp_path), "j1").status()["state"] == "failed"
+
+
+def test_attempt_files_of_the_new_layout(tmp_path, fake):
+    set_turns, _ = fake
+    set_turns(GOOD)
+    runner.call("j1", "secret question", store=S(tmp_path), model="m")
+    att = store.Job(S(tmp_path), "j1").launched()[0]
+    assert sorted(os.listdir(att)) == ["agy.args", "agy.err", "agy.out", "launch.json", "reply.txt", "result.json"]
+    assert "secret question" not in open(os.path.join(att, "agy.args")).read()
+    res = store.read_json(os.path.join(att, "result.json"))
+    assert res["exit"] == 0 and res["agyStatus"] == "SUCCESS" and res["classified"] == "reply" and res["outcome"] == "accepted"
+    assert "pstart" in store.read_json(os.path.join(att, "launch.json"))  # the value itself is tested in test_agy.py
+
+
+def test_oversized_prompt_and_bad_timeout_launch_nothing(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(GOOD)
+    with pytest.raises(ValueError, match="512 KiB"):
+        runner.call("j1", "é" * (256 * 1024 + 1), store=S(tmp_path), model="m")  # 2 bytes each in UTF-8
+    with pytest.raises(ValueError, match="timeout"):
+        runner.call("j2", "q", store=S(tmp_path), model="m", timeout="ten minutes")
+    assert launches() == [] and not os.path.exists(os.path.join(S(tmp_path), "j1"))

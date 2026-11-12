@@ -1,4 +1,4 @@
-"""One agy-call job: launch agy-delegate under the capture shim, check the reply, follow up in the same conversation."""
+"""One agy-call job: launch agy, check the reply, follow up in the same conversation."""
 import contextlib
 import dataclasses
 import datetime as dt
@@ -6,13 +6,10 @@ import glob
 import hashlib
 import json
 import os
-import shutil
-import subprocess
-import tempfile
 import time
 import types
 
-from . import checks, quota, shim
+from . import agy, checks, classify, quota
 from . import store as st
 from .errors import CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
 
@@ -25,7 +22,6 @@ DENIED = ("Your last tool call was denied by the permission policy. Do not repea
           "continue the task with the tools you are allowed, and give the complete answer.")
 LOST = "\n\nThe original request was:\n\n{prompt}"
 FIRST_LIKE = ("first", "retry-first", "fresh")
-_SHIM_DIR = None
 
 
 @dataclasses.dataclass
@@ -55,26 +51,6 @@ def conv_lock(conversation):
     return os.path.join(st.home(), "locks", "conv-%s.lock" % hashlib.sha256(conversation.encode()).hexdigest()[:32])
 
 
-def _delegate():
-    path = os.environ.get("AGY_DELEGATE") or shutil.which("agy-delegate")
-    if not path or not os.path.exists(path):
-        raise Fatal(13, "agy-delegate not found (set AGY_DELEGATE or install the antigravity plugin)")
-    return path
-
-
-def _real_agy():
-    if "AGYCALL_REAL_AGY" in os.environ:
-        return os.environ["AGYCALL_REAL_AGY"] or None
-    return shutil.which("agy")
-
-
-def _shim_dir():
-    global _SHIM_DIR
-    if _SHIM_DIR is None:
-        _SHIM_DIR = shim.install(tempfile.mkdtemp(prefix="agy-call-shim-"))
-    return _SHIM_DIR
-
-
 def parse_usage(err_text):
     for line in reversed(err_text.splitlines()):
         if line.startswith("AGY_USAGE "):
@@ -83,27 +59,6 @@ def parse_usage(err_text):
             except ValueError:
                 return {}
     return {}
-
-
-def _reason(err_text):
-    for line in reversed(err_text.splitlines()):
-        if line.startswith("AGY_SIGNAL "):
-            try:
-                return json.loads(line[len("AGY_SIGNAL "):]).get("reason") or line
-            except ValueError:
-                return line
-    lines = [l for l in err_text.splitlines() if l.strip() and not l.startswith("AGY_USAGE ")]
-    return lines[-1][:500] if lines else "no reason given"
-
-
-def _alive(pgid):
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
 
 
 def recover(job):
@@ -118,10 +73,10 @@ def recover(job):
     if os.path.exists(os.path.join(last, "result.json")):
         return
     launch = st.read_json(os.path.join(last, "launch.json"), {}) or {}
-    if launch.get("pgid") and _alive(launch["pgid"]):
+    if launch.get("pgid") and agy.alive(launch["pgid"]):
         raise Running("job %s is running (pid %s)" % (job.id, launch.get("pid")))
-    got = parse_usage(_read(os.path.join(last, "delegate.err"))).get("conversation_id") or None
-    st.write_atomic(os.path.join(last, "result.json"), {"rc": None, "outcome": "interrupted", "conversation": got, "ended": _now()})
+    got = _saved_conversation(last)
+    st.write_atomic(os.path.join(last, "result.json"), {"exit": None, "outcome": "interrupted", "conversation": got, "ended": _now()})
     if got and not job.status().get("conversation"):
         job.set_status(conversation=got)
 
@@ -168,8 +123,29 @@ def _agy_runs(att):
             yield _read(path)
 
 
+def _envelope(att):
+    try:
+        with open(os.path.join(att, "agy.out"), "rb") as fh:
+            return classify.envelope(fh.read())
+    except OSError:
+        return None
+
+
+def _saved_conversation(att):
+    """The conversation id an attempt saw; delegate.err holds it for attempts made before agy-call launched agy itself."""
+    return (_envelope(att) or {}).get("conversation_id") or \
+        parse_usage(_read(os.path.join(att, "delegate.err"))).get("conversation_id") or None
+
+
+def _saved_reply(att):
+    """The reply text an attempt received, in the new layout (reply.txt) or the old one (delegate.out, agy-N.out)."""
+    return _read(os.path.join(att, "reply.txt")) or _read(os.path.join(att, "delegate.out")) or _agy_reply(att) or ""
+
+
 def _agy_output(att):
-    """True when a captured agy invocation of this attempt (not a help probe) produced output."""
+    """True when an agy run of this attempt produced output that may belong to a conversation we did not capture."""
+    if _read(os.path.join(att, "agy.out")).strip():
+        return _envelope(att) is None  # a parsed envelope already told us its conversation id
     return any(out.strip() for out in _agy_runs(att))
 
 
@@ -186,38 +162,17 @@ def _agy_reply(att):
 
 
 def _launch(att, message, conv, o, kind, generation, fds):
-    cmd = [_delegate()]
-    if o.model:
-        cmd += ["--model", o.model]
-    cmd += ["--timeout", o.timeout]
-    for d in o.dirs:
-        cmd += ["--dir", d]
-    if o.mode:
-        cmd += ["--mode", o.mode]
-    if conv:
-        cmd += ["--conversation", conv]
-    cmd.append("-")
-    env = dict(os.environ, CLAUDE_PLUGIN_OPTION_STRUCTURED_OUTPUT="on")
-    real = _real_agy()
-    if real:
-        env = shim.env(env, _shim_dir(), att, real)
+    cmd = agy.argv(agy.path(), message, model=o.model, timeout=o.timeout, mode=o.mode, dirs=o.dirs, conversation=conv)
     launch = {"pid": None, "pgid": None, "kind": kind, "message": message, "conversation": conv,
-              "generation": generation, "started": _now(), "argv": cmd}
+              "generation": generation, "started": _now(), "argv": agy.redact(cmd)}
     st.write_atomic(os.path.join(att, "launch.json"), launch)
-    with open(os.path.join(att, "delegate.out"), "wb") as out, open(os.path.join(att, "delegate.err"), "wb") as err:
-        try:
-            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=o.cwd, env=env, start_new_session=True,
-                                 pass_fds=fds)  # the delegate tree keeps the locks held until it exits
-        except OSError as e:
-            raise Fatal(13, "agy-delegate could not start: %s" % e)
-        launch.update(pid=p.pid, pgid=p.pid)
+
+    def started(pid, when):
+        launch.update(pid=pid, pgid=pid, pstart=when)
         st.write_atomic(os.path.join(att, "launch.json"), launch)
-        try:
-            p.stdin.write(message.encode("utf-8"))
-            p.stdin.close()
-        except BrokenPipeError:
-            pass
-        return p.wait()
+
+    r = agy.run(att, cmd, cwd=o.cwd, deadline=agy.seconds(o.timeout) + agy.GRACE, fds=fds, on_start=started)
+    return classify.classify(r.exit, r.out, r.err, r.stopped)
 
 
 def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m", cwd=None, dirs=(),
@@ -225,7 +180,13 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
          check=None, check_id=None, max_turns=4, ignore_quota=False, fresh=False, new_version=False):
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
+    size = len(prompt.encode("utf-8"))
+    if size > agy.MAX_PROMPT:
+        raise ValueError("the prompt is %d bytes; agy takes it as one argument, so the limit is 512 KiB: "
+                         "put the material in a file under the working directory and refer to it" % size)
+    agy.seconds(timeout)  # a bad timeout fails here, before any attempt folder exists
     checker, cident = checks.make_check(expect, require, schema, check_cmd, check_timeout, check, check_id)
+    checked = any(cident[k] for k in ("json", "require", "schema", "cmd", "check_id"))
     o = types.SimpleNamespace(model=model, timeout=timeout, mode=mode,
                               cwd=os.path.abspath(cwd or os.getcwd()), dirs=[os.path.abspath(d) for d in dirs])
     key = model
@@ -262,7 +223,7 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
             fds.append(stack.enter_context(st.flock(conv_lock(conv))).fileno())
         last_res = st.read_json(os.path.join(done[-1], "result.json"), {}) if done else {}
         if (last_res or {}).get("outcome") == "check-error":  # the reply is saved: check it again before any new turn
-            verdict = checker(_read(os.path.join(done[-1], "delegate.out")) or _agy_reply(done[-1]) or "")
+            verdict = checker(_saved_reply(done[-1]))
             if verdict.ok:
                 st.write_atomic(job.path("answer.txt"), verdict.answer)
                 job.set_status(state="done", answer=True, conversation=conv, findings=[])
@@ -295,16 +256,16 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
             att = job.new_attempt()
             job.set_status(state="running", attempts=len(atts) + 1, conversation=conv)
             try:
-                rc = _launch(att, message, conv, o, kind, generation, fds)
+                oc = _launch(att, message, conv, o, kind, generation, fds)
             except Fatal as e:
-                st.write_atomic(os.path.join(att, "result.json"), {"rc": None, "outcome": "fatal", "findings": [e.reason], "ended": _now()})
+                st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "fatal", "findings": [e.reason], "ended": _now()})
                 job.set_status(state="fatal", findings=[e.reason])
                 raise
-            err = _read(os.path.join(att, "delegate.err"))
-            text = _read(os.path.join(att, "delegate.out"))
-            usage = parse_usage(err)
-            got = usage.get("conversation_id") or None
-            res = {"rc": rc, "conversation": got, "usage": usage.get("usage") or {}, "ended": _now()}
+            if oc.response:
+                st.write_atomic(os.path.join(att, "reply.txt"), oc.response)
+            got = oc.conversation
+            res = {"exit": oc.exit, "agyStatus": oc.status, "classified": oc.name, "conversation": got,
+                   "usage": oc.usage, "ended": _now()}
             if got and not conv:
                 conv = got
                 fds.append(stack.enter_context(st.flock(conv_lock(conv))).fileno())
@@ -318,12 +279,19 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                 if state:
                     job.set_status(state=state, findings=res.get("findings", []))
 
-            reply = _agy_reply(att) if rc in (2, 3) else None
-            if reply:  # agy failed after writing a reply (seen with its output-limit error): check that reply
-                text, res["agyError"] = reply, _reason(err)
-            if rc == 0 or reply:
+            def give_up(findings):
+                finish("failed", outcome="failed", findings=findings)
+                raise GaveUp(findings, conv, _usage(job), job.dir)
+
+            name = oc.name
+            if name == "reply" or (name in ("reply-with-error", "output-limit") and oc.response.strip()):
+                if name != "reply":
+                    res["agyError"] = oc.reason
+                    if not checked:
+                        give_up(["%s; the reply is saved in %s and is accepted after an agy error only by a check you ask for"
+                                 % (oc.reason, os.path.join(att, "reply.txt"))])
                 try:
-                    verdict = checker(text)
+                    verdict = checker(oc.response)
                 except CheckError as e:
                     finish("check-error", outcome="check-error", findings=[str(e)])
                     raise
@@ -334,35 +302,32 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                     if generation is not None:
                         quota.clear(key, generation)
                     return _result(job, cident["json"])
+                if name != "reply":  # later turns in such a conversation failed the same way: send nothing more
+                    give_up(verdict.findings + ["no follow-up was sent because agy reported an error: %s" % oc.reason])
                 finish(outcome="rejected", findings=verdict.findings, lostContext=verdict.lost_context)
-            elif rc == 12:
-                finish(outcome="timeout", partial=bool(text.strip()))
-            elif rc == 15:
+            elif name == "output-limit":
+                give_up(["agy stopped at its output token limit without a reply; its output is saved in %s. "
+                         "Ask for the work as files on disk and a short reply" % att])
+            elif name == "timeout":
+                finish(outcome="timeout", partial=bool(oc.response.strip()))
+            elif name == "denied":
                 if any(l.get("kind") == "denied" for l in launches):
-                    finish("failed", outcome="failed", findings=["a tool call was denied twice"])
-                    raise GaveUp(["a tool call was denied twice"], conv, _usage(job), job.dir)
+                    give_up(["a tool call was denied twice"])
                 finish(outcome="denied")
-            elif rc in (2, 3) and "exceeded the output token limit" in err:
-                # once a conversation hits this, every later turn in it failed the same way, so a resend only spends quota
-                findings = ["agy stopped at its output token limit without a reply; its output is saved in %s. "
-                            "Ask for the work as files on disk and a short reply" % att]
-                finish("failed", outcome="failed", findings=findings)
-                raise GaveUp(findings, conv, _usage(job), job.dir)
-            elif rc in (2, 3):
+            elif name == "empty":
                 if kind in ("retry", "retry-first"):
-                    finish(outcome="rejected", findings=["agy-delegate exit %d: %s" % (rc, _reason(err))])
+                    finish(outcome="rejected", findings=[oc.reason])
                 else:
-                    finish(outcome="retry", findings=["agy-delegate exit %d: %s" % (rc, _reason(err))])
+                    finish(outcome="retry", findings=[oc.reason])
                     time.sleep(RETRY_WAIT)
-            elif rc == 10:
-                streams = [_read(p) for p in sorted(glob.glob(os.path.join(att, "agy-*.err")))]
-                streams += [_read(p) for p in sorted(glob.glob(os.path.join(att, "agy-*.out")))] + [err]
-                until = quota.hold(key, _reason(err), quota.parse_reset(streams) or quota.DEFAULT_HOLD)
+            elif name == "quota":
+                streams = [_read(os.path.join(att, "agy.err")), _read(os.path.join(att, "agy.out"))]
+                until = quota.hold(key, oc.reason, quota.parse_reset(streams) or quota.DEFAULT_HOLD)
                 finish("quota", outcome="quota", until=until.isoformat())
                 raise Quota(key, until)
-            elif rc in (11, 13, 14):
-                finish("fatal", outcome="fatal", findings=[_reason(err)])
-                raise Fatal(rc, _reason(err))
-            else:
-                finish("fatal", outcome="fatal", findings=["agy-delegate exited %s: %s" % (rc, _reason(err))])
-                raise Fatal(22, "agy-delegate exited %s: %s" % (rc, _reason(err)))
+            else:  # auth, model, malformed
+                reason = oc.reason
+                if name == "malformed":
+                    reason += "; the raw output is in %s" % os.path.join(att, "agy.out")
+                finish("fatal", outcome="fatal", findings=[reason])
+                raise Fatal({"auth": 11, "model": 14}.get(name, 22), reason)

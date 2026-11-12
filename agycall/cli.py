@@ -62,11 +62,18 @@ def main(argv):
         except AgyCallError as e:
             print("agy-call: %s" % e, file=sys.stderr)
             return e.code
+        except ValueError as e:  # a bad argument, job id, timeout or prompt size
+            print("agy-call: %s" % e, file=sys.stderr)
+            return 2
         sys.stdout.write(res.text if res.text.endswith("\n") else res.text + "\n")
         return 0
     with open(a.jobs_file, encoding="utf-8") as fh:
         jobs = [json.loads(l) for l in fh if l.strip()]
-    res = batch(jobs, workers=a.workers, **_opts(a))
+    try:
+        res = batch(jobs, workers=a.workers, **_opts(a))
+    except ValueError as e:  # duplicate job ids
+        print("agy-call: %s" % e, file=sys.stderr)
+        return 2
     states = collections.Counter("done" if not isinstance(v, Exception) else type(v).__name__ for v in res.values())
     for s, n in sorted(states.items()):
         print("%s %d" % (s, n))
