@@ -240,6 +240,8 @@ Rules, applied in this order:
 | 13 | `unknown` | anything else |
 
 "Error text" is the envelope's `error` field followed by stderr, compared case-insensitively.
+Row 3 is raised by the launcher as exit 13 when agy cannot be found or started, rather than returned by the classifier.
+Row 13 cannot be reached once rows 1 to 12 exist (a blank reply is `empty`, a non-blank one is `reply` or `reply-with-error`, and an envelope whose `response` is not a string counts as `malformed`), so it is not implemented.
 Rules 4 to 8 apply whatever the exit status is, and before the envelope is required to parse, because agy has reported failures with exit 0, with exit 1, and with no JSON on stdout.
 The outcome record keeps the raw exit status, the envelope `status`, the outcome name and the public exit code as separate fields.
 
@@ -288,6 +290,7 @@ For task and review jobs, `--max-turns` (default 3) counts every launch in the c
 The agy path comes from `AGYCALL_AGY` or `agy` on PATH; `AGY_DELEGATE` and `AGYCALL_REAL_AGY` are no longer read.
 The prompt is passed as one argument and stdin is `/dev/null`; a prompt over 512 KiB is refused before launch with exit 2 and a message to put the material in a file under the working directory.
 stdout and stderr go straight to `attempts/NNN/agy.out` and `agy.err`; the argument list goes to `agy.args` with the prompt replaced by its length and SHA-256 (the prompt itself is in `launch.json`).
+After the run, the envelope's `response`, when present, is also written to `reply.txt`, so a person can read the reply without parsing JSON.
 agy runs in its own process group; `launch.json` records the pid, the process group id and the process start time (from `ps -o lstart= -p <pid>`), written immediately after the process starts.
 The controller polls once per second instead of blocking: it stops the run when the turn deadline (the turn timeout plus 60 seconds) passes or a cancel request appears (7.3), sending SIGTERM to the process group, then SIGKILL after 10 seconds.
 The job lock descriptors are inherited by agy, as today, so a second controller cannot launch while agy lives.
