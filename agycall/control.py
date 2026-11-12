@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from . import agy, runner, task, worktree
+from . import agy, review, runner, task, worktree
 from . import store as st
 from .errors import AgyCallError
 
@@ -118,7 +118,8 @@ def status_all():
         found = jobs(store)
         if not found:
             continue
-        top = next(((_request(j).get("task") or {}).get("checkout") for j in found if _request(j).get("task")), None)
+        top = next(((_request(j).get("task") or _request(j).get("review") or {}).get("checkout") for j in found
+                    if _request(j).get("kind") in ("task", "review")), None)
         head = "%s (repository %s)" % (store, top) if top else store
         blocks.append("\n".join([head] + ["  " + line for line in status(store)[0].splitlines()]))
     return "\n\n".join(blocks) or "no jobs in %s" % root, 0
@@ -137,7 +138,8 @@ def result(store, job_id=None):
     s = job.status()
     state = s.get("state")
     if state == "done" and os.path.exists(job.path("answer.txt")):
-        text, code = runner._read(job.path("answer.txt")), 0
+        text = review.render(job) if _request(job).get("kind") == "review" else runner._read(job.path("answer.txt"))
+        code = 0
     else:
         lines = ["state: %s" % _state(job)] + ["finding: %s" % f for f in s.get("findings") or []]
         for att in reversed(job.launched()):
@@ -233,7 +235,7 @@ def start(job_id, prompt, **kw):
 
 
 def spawn(job):
-    """Start the detached worker of a queued job, run or task; returns the job id."""
+    """Start the detached worker of a queued job, run, task or review; returns the job id."""
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (ROOT, os.environ.get("PYTHONPATH")) if p))
     exe = os.environ.get("AGYCALL_AGY") or shutil.which("agy")  # the worker starts in the job folder: make it absolute here
     if exe:
@@ -265,6 +267,8 @@ def work(store, job_id):
     try:
         if args.get("kind") == "task":
             task.drive(job)
+        elif args.get("kind") == "review":
+            review.drive(job)
         else:
             runner.call(**args)
     except Exception as e:  # a start failure leaves the job queued: a schema file that has gone or changed

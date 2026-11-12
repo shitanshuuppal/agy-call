@@ -165,12 +165,18 @@ def _snapshot(top, rv):
         worktree.git(top, "worktree", "add", "-q", "--detach", rv["worktree"], rv["snapshot"])
 
 
+def _queue(job):
+    """Mark a review for the background worker: control.work reads the kind from background.json."""
+    st.write_atomic(job.path("background.json"), {"kind": "review"})
+    job.set_status(state="queued")
+
+
 def start(*, model, effort=None, scope="auto", base=None, adversarial=False, focus=None, job_id=None, timeout="20m",
-          max_turns=3, cwd=None):
+          max_turns=3, cwd=None, background=False):
     """`agy-call review` (spec 8.1 to 8.3, 8.6): the target and the identity come first, then the job id; under the job
     lock and the repository lock, the same review already recorded is reused, or the snapshot commit, the schema file
     and request.json are written; then the snapshot ref and worktree are made unless the review is done. Returns the
-    job; drive() runs it."""
+    job; drive() runs it, or with background the job is queued for control.spawn, after the snapshot exists."""
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
     if scope not in SCOPES:
@@ -214,6 +220,8 @@ def start(*, model, effort=None, scope="auto", base=None, adversarial=False, foc
             st.write_atomic(job.path("request.json"), req)
         if not os.path.exists(job.path("answer.txt")):
             _snapshot(r.top, req["review"])
+        if background:
+            _queue(job)
     return job
 
 
@@ -268,3 +276,51 @@ def drive(job):
         c.refresh = lambda: task.write_grant(rv["grant"], None, ())
         runner._own(c, stack)
         return runner._drive(c, rv["maxTurns"], False, False)
+
+
+def render(job):
+    """What `result` prints for a finished review (spec 8.5): the verdict, the count at each severity, one block per
+    finding and the path of the full JSON; then a warning when the code of the same scope has changed since."""
+    rv = (st.read_json(job.path("request.json"), {}) or {})["review"]
+    data = json.loads(runner._read(job.path("answer.txt")))
+    counts = collections.Counter(f["severity"] for f in data["findings"])
+    lines = ["verdict: %s" % data["verdict"], "findings: " + ", ".join("%d %s" % (counts[s], s) for s in SEVERITIES)]
+    if data.get("missing_files"):
+        lines.append("not reviewed: " + ", ".join(data["missing_files"]))
+    for f in data["findings"]:
+        where = f["file"] or "(the change as a whole)"
+        if f["file"] and f["line_start"]:
+            where += ":%d" % f["line_start"]
+            if f["line_end"] and f["line_end"] != f["line_start"]:
+                where += "-%d" % f["line_end"]
+        lines += ["", "%s: %s" % (f["severity"], f["title"]), "  where: " + where,
+                  "  how it is reached: " + f["how_hit"], "  fix: " + f["fix"]]
+    lines += ["", "full JSON: " + job.path("answer.txt")]
+    try:
+        top = rv["checkout"]
+        now = tree(top) if rv["scope"] == "working-tree" else worktree.git(top, "rev-parse", "HEAD^{tree}").strip()
+    except (RepoState, OSError) as e:
+        lines.append("could not compare the code with this review: %s" % e)
+    else:
+        if now != rv["tree"]:
+            lines.append("code changed since this review (snapshot %s, now %s)" % (rv["tree"][:12], now[:12]))
+    return "\n".join(lines)
+
+
+def cleanup(job_id, cwd=None):
+    """`agy-call review --cleanup JOB` (spec 8.3): under the job lock and the repository lock, remove the snapshot
+    worktree and the snapshot ref, whichever still exist; the job record stays. Returns (text, 0)."""
+    r = worktree.repo(cwd)
+    job = st.Job(r.store, job_id)
+    rv = (st.read_json(job.path("request.json"), {}) or {}).get("review")
+    if not rv:
+        raise ValueError("no review %s in %s" % (job_id, r.store))
+    with contextlib.ExitStack() as stack:
+        runner._lock(job, stack)
+        stack.enter_context(worktree.lock(r))
+        if os.path.isdir(rv["worktree"]):
+            worktree.git(r.top, "worktree", "remove", rv["worktree"])
+        if worktree._ok(r.top, "show-ref", "--verify", "--quiet", rv["ref"]):
+            worktree.git(r.top, "update-ref", "-d", rv["ref"])
+    return "removed the snapshot worktree %s and %s; the review record stays in %s" % (rv["worktree"], rv["ref"],
+                                                                                        job.dir), 0

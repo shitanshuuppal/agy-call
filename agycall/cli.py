@@ -1,11 +1,11 @@
-"""agy-call run [--background] | batch | task | status | result | cancel. Prints the accepted answer or the report on
+"""agy-call run [--background] | batch | task | review | status | result | cancel. Prints the accepted answer or the report on
 stdout; errors on stderr; exit codes in SKILL.md."""
 import argparse
 import collections
 import json
 import sys
 
-from . import control, task, worktree
+from . import control, review, task, worktree
 from . import store as st
 from .batch import batch
 from .errors import AgyCallError, Cancelled, Quota, RepoState, Running
@@ -102,6 +102,24 @@ def _task(a):
     return control.result(job.store, job.id)
 
 
+def _review(a):
+    """agy-call review: review the repository's change in a snapshot and print the findings (spec 8), or remove a
+    review's snapshot (--cleanup)."""
+    if a.cleanup:
+        return review.cleanup(a.cleanup)
+    job = review.start(model=a.model, effort=a.effort, scope=a.scope, base=a.base, adversarial=a.adversarial,
+                       focus=a.focus, job_id=a.job, timeout=a.timeout, max_turns=a.max_turns, background=a.background)
+    if a.background:
+        return control.spawn(job), 0
+    try:
+        review.drive(job)
+    except (Running, RepoState):  # nothing ran: the job is held elsewhere, or its snapshot is gone
+        raise
+    except AgyCallError as e:  # a recorded failure: print the state, findings and last reply as well
+        print("agy-call: %s" % e, file=sys.stderr)
+    return control.result(job.store, job.id)
+
+
 def _store(a):
     """--store or --namespace when given; else the repository store when the current directory is inside a git
     repository; else the default store."""
@@ -153,6 +171,18 @@ def main(argv):
     actions = t.add_mutually_exclusive_group()
     for action in ("merge", "cleanup", "discard"):
         actions.add_argument("--" + action, metavar="JOB")
+    v = sub.add_parser("review")
+    v.add_argument("--job")
+    v.add_argument("--model")
+    v.add_argument("--effort")
+    v.add_argument("--scope", choices=review.SCOPES, default="auto")
+    v.add_argument("--base")
+    v.add_argument("--adversarial", action="store_true")
+    v.add_argument("--focus")
+    v.add_argument("--background", action="store_true")
+    v.add_argument("--max-turns", type=int, default=3)
+    v.add_argument("--timeout", default="20m")
+    v.add_argument("--cleanup", metavar="JOB")
     w = sub.add_parser("worker")  # started by run --background; not for direct use
     w.add_argument("--store", required=True)
     w.add_argument("--job", required=True)
@@ -166,6 +196,8 @@ def main(argv):
             return _run(a)
         if a.cmd == "task":
             text, code = _task(a)
+        elif a.cmd == "review":
+            text, code = _review(a)
         elif a.cmd == "status" and a.all:
             text, code = control.status_all()
         else:

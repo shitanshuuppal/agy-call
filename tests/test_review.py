@@ -2,13 +2,21 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 
 import pytest
 
 from agycall import quota, review, runner, store, task, worktree
 from agycall.errors import Blocked, Fatal, GaveUp, Mismatch, Quota, RepoState
-from agyturns import denied, empty, error_reply, git, model_error, partial, quota_error, reply
+from agyturns import denied, empty, error_reply, git, model_error, partial, quota_error, reply, wait_for
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
+
+
+def run_cli(*args, **kw):
+    return subprocess.run([sys.executable, AGYCALL, *args], capture_output=True, text=True, timeout=60, **kw)
 
 
 def _rv(job):
@@ -371,3 +379,83 @@ def test_scope_detection_leaves_the_index_bytes_alone(repo):
     index = (repo / ".git" / "index").read_bytes()
     review.start(model="m")
     assert (repo / ".git" / "index").read_bytes() == index
+
+
+def test_cli_review_prints_the_findings_and_result_warns_when_the_code_changed(repo, fake):
+    set_turns, _ = fake
+    r = run_cli("review", "--model", "m", cwd=str(repo))
+    assert r.returncode == 26 and "nothing to review" in r.stderr
+    _changed(repo, "a.txt")
+    set_turns(reply(_review_json(["a.txt"], findings=[_finding("a.txt"),
+                                                     _finding(None, "NIT", None, None, title="Name the flag")])))
+    r = run_cli("review", "--model", "m", cwd=str(repo))
+    assert r.returncode == 0, r.stderr
+    store_dir = worktree.repo().store
+    job = store.Job(store_dir, next(n for n in os.listdir(store_dir) if n.startswith("review-standard-")))
+    assert r.stdout == ("verdict: changes-needed\nfindings: 1 MUST-FIX, 0 SHOULD-FIX, 1 NIT\n\n"
+                        "MUST-FIX: Crash on empty input\n  where: a.txt:1-2\n  how it is reached: Run it on an empty "
+                        "file.\n  fix: Return early on empty input.\n\nNIT: Name the flag\n  where: (the change as a "
+                        "whole)\n  how it is reached: Run it on an empty file.\n  fix: Return early on empty input.\n\n"
+                        "full JSON: %s\n" % job.path("answer.txt"))
+    r = run_cli("status", cwd=str(repo))
+    assert r.stdout.startswith("%s  done  review  " % job.id), r.stdout
+    (repo / "a.txt").write_text("edited after the review\n")
+    r = run_cli("result", job.id, cwd=str(repo))
+    assert r.returncode == 0 and "\ncode changed since this review (snapshot %s, now " % _rv(job)["tree"][:12] in r.stdout
+
+
+def test_a_background_review_takes_its_snapshot_before_it_returns(repo, fake, tmp_path):
+    set_turns, _ = fake
+    _changed(repo, "a.txt")
+    set_turns(reply(_review_json(["a.txt"]), sleep=2))
+    env = dict(os.environ, PATH="/usr/bin:/bin")  # no agy-call on the PATH: the worker must use this checkout
+    r = run_cli("review", "--model", "m", "--background", cwd=str(repo), env=env)
+    assert r.returncode == 0, r.stderr
+    job = store.Job(worktree.repo().store, r.stdout.strip())
+    (repo / "a.txt").write_text("edited while the review runs\n")
+    (repo / "z.txt").write_text("new\n")
+    assert job.status()["state"] in ("queued", "running")  # the command returned while the turn still runs
+    wait_for(lambda: job.status().get("state") == "done")
+    rv = _rv(job)
+    assert rv["files"] == ["a.txt"] and open(os.path.join(rv["worktree"], "a.txt")).read() == "changed a.txt\n"
+    r = run_cli("result", job.id, cwd=str(repo), env=env)
+    assert r.stdout.startswith("verdict: changes-needed\n") and "code changed since this review" in r.stdout
+    assert "agy-call worker: done" in open(job.path("worker.log")).read()
+    r = run_cli("status", "--all", cwd=str(tmp_path), env=env)
+    assert "%s (repository %s)\n  %s  done  review  " % (job.store, worktree.repo().top, job.id) in r.stdout
+
+
+def test_cleanup_removes_the_snapshot_and_keeps_the_record_and_the_saved_review(repo, fake):
+    set_turns, launches = fake
+    _changed(repo, "a.txt")
+    set_turns(reply(_review_json(["a.txt"])))
+    job = review.start(model="m")
+    review.drive(job)
+    rv = _rv(job)
+    with store.flock(job.lock_path):  # held as a running review holds it
+        assert run_cli("review", "--cleanup", job.id, cwd=str(repo)).returncode == 25
+    r = run_cli("review", "--cleanup", job.id, cwd=str(repo))
+    assert r.returncode == 0 and "the review record stays" in r.stdout, r.stderr
+    assert not os.path.exists(rv["worktree"]) and _refs(repo) == [] and os.path.exists(job.path("answer.txt"))
+    assert len(git(repo, "worktree", "list").splitlines()) == 1  # only the main checkout is left
+    assert run_cli("review", "--cleanup", job.id, cwd=str(repo)).returncode == 0  # nothing left to remove
+    r = run_cli("review", "--model", "m", cwd=str(repo))  # the same review again: the saved one, and no new snapshot
+    assert r.returncode == 0 and r.stdout.startswith("verdict: changes-needed\n") and len(launches()) == 1
+    assert _refs(repo) == [] and not os.path.exists(rv["worktree"])
+    assert run_cli("review", "--cleanup", "nope", cwd=str(repo)).returncode == 2
+
+
+def test_a_rerun_after_cleanup_of_an_unfinished_review_makes_the_snapshot_again(repo, fake):
+    set_turns, launches = fake
+    _changed(repo, "a.txt")
+    set_turns(quota_error(), reply(_review_json(["a.txt"])))
+    job = review.start(model="m")
+    with pytest.raises(Quota):
+        review.drive(job)
+    rv = _rv(job)
+    assert review.cleanup(job.id)[1] == 0 and not os.path.exists(rv["worktree"])
+    with pytest.raises(RepoState, match="run the same review command again"):
+        review.drive(job)
+    quota.clear("m", quota.generation("m"))
+    assert review.drive(review.start(model="m")).text and len(launches()) == 2
+    assert os.path.isdir(rv["worktree"]) and _refs(repo) == ["refs/agy-call/" + job.id]
