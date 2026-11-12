@@ -176,3 +176,43 @@ def test_cli_status_result_and_cancel(tmp_path, fake):
     assert r.returncode == 0 and r.stdout == "done\n"
     r = run_cli("result", "nope", "--store", S(tmp_path))
     assert r.returncode == 2 and "no job nope" in r.stderr
+
+
+def _sleeper():
+    p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    threading.Thread(target=p.wait, daemon=True).start()  # reap it, as init would an orphan; a zombie group rejects signals
+    return p, {"pid": p.pid, "pgid": p.pid, "pstart": agy.start_time(p.pid)}
+
+
+def test_cancel_stops_the_check_of_a_check_error_recheck(tmp_path):
+    job = _fake_job(tmp_path, state="checking", controller=None)  # the controller died during the recheck
+    att = job.new_attempt()
+    store.write_atomic(os.path.join(att, "launch.json"), {"pid": 1, "pgid": 1, "pstart": "gone"})
+    store.write_atomic(os.path.join(att, "result.json"), {"outcome": "check-error"})  # the recheck runs against this
+    p, rec = _sleeper()
+    store.write_atomic(os.path.join(att, "check.json"), rec)
+    try:
+        assert ("check", p.pid) in control.live(job)
+        assert bounded(lambda: control.cancel(S(tmp_path), "j1"), [p.pid]) == ("cancelled", 0)
+        assert p.wait(timeout=10) != 0
+        assert job.status()["state"] == "cancelled"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_cancel_does_not_claim_success_while_a_launch_has_no_recorded_pid(tmp_path):
+    job = _fake_job(tmp_path, state="running", controller=None)
+    att = job.new_attempt()
+    store.write_atomic(os.path.join(att, "launch.json"), {"pid": None, "pgid": None})  # died before on_start
+    with store.flock(job.lock_path):  # the unrecorded agy child still holds the job lock
+        assert bounded(lambda: control.cancel(S(tmp_path), "j1")) == ("still stopping (pid unknown)", 25)
+    assert job.status()["state"] == "running"
+    assert not os.path.exists(os.path.join(att, "result.json"))
+
+
+def test_cancel_without_an_id_counts_a_live_controller_whatever_the_recorded_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGYCALL_SESSION", "s1")
+    _fake_job(tmp_path, "rerun", session="s1", state="check-error", controller=_me())
+    _fake_job(tmp_path, "old", session="s1", state="failed")
+    assert control._only_running(S(tmp_path)).id == "rerun"

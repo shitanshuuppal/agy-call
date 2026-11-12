@@ -8,7 +8,7 @@ import sys
 from . import control
 from . import store as st
 from .batch import batch
-from .errors import AgyCallError, Quota
+from .errors import AgyCallError, Cancelled, Quota
 from .runner import call
 
 
@@ -69,7 +69,9 @@ def _batch(a):
             print("  %s: %s" % (job_id, v))
     if all(not isinstance(v, Exception) for v in res.values()):
         return 0
-    return 10 if any(isinstance(v, Quota) for v in res.values()) else 20
+    if any(isinstance(v, Quota) for v in res.values()):
+        return 10
+    return 27 if any(isinstance(v, Cancelled) for v in res.values()) else 20
 
 
 def main(argv):

@@ -87,3 +87,15 @@ def test_cli_value_errors_exit_2(tmp_path, fake):
     assert r.returncode == 2 and "model is required" in r.stderr
     r = run_cli("run", "--job", "bad/id", "--store", str(tmp_path / "s"), "--model", "m", "--prompt", "q")
     assert r.returncode == 2 and "job id" in r.stderr
+
+
+def test_cli_batch_exits_27_when_a_job_was_cancelled(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply("ok"))
+    cancelled = tmp_path / "s" / "j0"
+    cancelled.mkdir(parents=True)
+    (cancelled / "cancel.request").write_text("{}")  # the runner stops before its first launch
+    jf = tmp_path / "jobs.jsonl"
+    jf.write_text(json.dumps({"job": "j0", "prompt": "p"}) + "\n")
+    r = run_cli("batch", str(jf), "--store", str(tmp_path / "s"), "--model", "m")
+    assert r.returncode == 27 and "Cancelled" in r.stdout and launches() == []

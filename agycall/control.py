@@ -59,9 +59,10 @@ def live(job):
             procs.append(("agy", None))
         elif agy.owns(launch):
             procs.append(("agy", launch["pid"]))
-        check = st.read_json(os.path.join(att, "check.json"))
-        if agy.owns(check):
-            procs.append(("check", check["pid"]))
+    atts = job.launched()
+    check = st.read_json(os.path.join(atts[-1], "check.json")) if atts else None  # a check-error recheck has a result
+    if agy.owns(check):
+        procs.append(("check", check["pid"]))
     return procs
 
 
@@ -128,7 +129,7 @@ def result(store, job_id=None):
 
 
 def _only_running(store):
-    running = [j for j in _mine(store) if j.status().get("state") in ACTIVE]
+    running = [j for j in _mine(store) if j.status().get("state") in ACTIVE or agy.owns(j.status().get("controller"))]
     if not running:
         raise ValueError("no job of this session is running in %s" % store)
     if len(running) > 1:
@@ -139,16 +140,26 @@ def _only_running(store):
 def _stop_orphans(job):
     """No controller is alive, so nothing will act on cancel.request: stop the newest attempt's check and agy process
     groups while they are still the recorded processes, record the attempt and the job as cancelled, and return the pid
-    of a group that outlived SIGKILL (else None)."""
+    of a group that outlived SIGKILL, or "unknown" when the job lock is still held after every recorded process was
+    stopped (a launch whose pid was never recorded), else None. In both cases the job's state is left as it was."""
+    atts = job.launched()
     att = runner.pending(job)
+    recs = []
+    if atts:  # the newest attempt's check, even when it has a result: a check-error recheck runs against that result
+        recs.append(st.read_json(os.path.join(atts[-1], "check.json")))
     if att:
-        for name in ("check.json", "launch.json"):
-            rec = st.read_json(os.path.join(att, name))
-            if agy.owns(rec) and not agy.stop_group(rec["pgid"]):
-                return rec["pid"]
-        if not os.path.exists(os.path.join(att, "result.json")):  # a rerun that started meanwhile may have settled it
-            st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "cancelled", "classified": "cancelled",
-                                                               "findings": [runner.CANCELLED], "ended": runner._now()})
+        recs.append(st.read_json(os.path.join(att, "launch.json")))
+    for rec in recs:
+        if agy.owns(rec) and not agy.stop_group(rec["pgid"]):
+            return rec["pid"]
+    try:
+        with st.flock(job.lock_path, blocking=False):
+            pass
+    except st.Busy:
+        return "unknown"
+    if att and not os.path.exists(os.path.join(att, "result.json")):  # a rerun that started meanwhile may have settled it
+        st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "cancelled", "classified": "cancelled",
+                                                           "findings": [runner.CANCELLED], "ended": runner._now()})
     job.set_status(state="cancelled", findings=[runner.CANCELLED])
     return None
 
