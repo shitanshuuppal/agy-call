@@ -198,3 +198,40 @@ def test_make_check_passes_run_options_and_does_not_wrap_a_cancel(tmp_path, monk
     check, _ = checks.make_check(check_cmd="sleep 30")
     with pytest.raises(Cancelled):
         check("text", should_stop=lambda: "cancel")
+
+
+def test_schema_type_lists_lengths_bounds_and_closed_objects(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"type": "object", "additionalProperties": False, "required": ["summary", "line"],
+                             "properties": {"summary": {"type": "string", "minLength": 1},
+                                            "line": {"type": ["integer", "null"], "minimum": 1, "maximum": 9}}}))
+    check, _ = checks.make_check(schema=str(p))
+    assert check('{"summary": "s", "line": 3}').ok and check('{"summary": "s", "line": null}').ok
+    v = check('{"summary": "", "line": -4, "extra": 1}')
+    assert not v.ok and sorted(v.findings) == ["$ has a key the schema does not allow: extra",
+                                               "$.line should be at least 1", "$.summary should have length 1 or more"]
+    assert check('{"summary": "s", "line": 10}').findings == ["$.line should be at most 9"]
+    assert check('{"summary": "s", "line": "3"}').findings == ["$.line should be integer or null"]
+    assert check('{"summary": "s", "line": true}').findings == ["$.line should be integer or null"]
+
+
+@pytest.mark.parametrize("schema", [{"type": "string", "pattern": "^a"}, {"$schema": "x"}, {"description": "d"},
+                                    {"properties": {"a": {"oneOf": []}}}, {"items": {"format": "date"}},
+                                    {"additionalProperties": True}, {"additionalProperties": {"type": "string"}},
+                                    {"minLength": "1"}, {"maximum": True}, {"type": []}, {"type": ["string", "int"]}])
+def test_a_schema_the_validator_cannot_enforce_is_refused(tmp_path, schema):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(schema))
+    with pytest.raises(ValueError, match="invalid schema"):
+        checks.make_check(schema=str(p))
+
+
+def test_run_refuses_an_unenforced_schema_keyword_before_any_launch(tmp_path, fake, capsys):
+    from agycall import cli
+    set_turns, launches = fake
+    set_turns({"response": '{"a": "x"}', "conversation": "c1"})
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"type": "object", "properties": {"a": {"type": "string", "pattern": "^x"}}}))
+    code = cli.main(["run", "--job", "j", "--model", "m", "--prompt", "p", "--schema", str(p),
+                     "--store", str(tmp_path / "s")])
+    assert code == 2 and "pattern" in capsys.readouterr().err and launches() == []

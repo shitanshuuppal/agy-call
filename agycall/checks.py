@@ -16,6 +16,8 @@ FENCE = re.compile(r"```(?:json)?[ \t]*\n?([\s\S]*?)```")
 Verdict = collections.namedtuple("Verdict", "ok answer findings lost_context")
 _NAMES = {"object", "array", "string", "number", "integer", "boolean", "null"}
 TYPES = {"object": dict, "array": list, "string": str, "boolean": bool, "null": type(None)}
+KEYWORDS = {"type", "enum", "required", "properties", "items", "additionalProperties", "minLength", "minimum",
+            "maximum"}  # spec 8.4: every keyword the validator enforces; any other one is refused
 TAIL = 4000  # characters of a task check's output sent back as the finding
 
 
@@ -40,6 +42,8 @@ def extract_json(text):
 
 
 def _type_ok(value, t):
+    if isinstance(t, list):
+        return any(_type_ok(value, x) for x in t)
     if t == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if t == "integer":
@@ -49,16 +53,26 @@ def _type_ok(value, t):
 
 def validate(value, schema, where="$"):
     t = schema.get("type")
-    if t and not _type_ok(value, t):
-        return ["%s should be %s" % (where, t)]
+    if t is not None and not _type_ok(value, t):
+        return ["%s should be %s" % (where, t if isinstance(t, str) else " or ".join(t))]
     out = []
     if "enum" in schema and value not in schema["enum"]:
         out.append("%s should be one of %s" % (where, schema["enum"]))
+    if isinstance(value, str) and len(value) < schema.get("minLength", 0):
+        out.append("%s should have length %s or more" % (where, schema["minLength"]))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            out.append("%s should be at least %s" % (where, schema["minimum"]))
+        if "maximum" in schema and value > schema["maximum"]:
+            out.append("%s should be at most %s" % (where, schema["maximum"]))
     if isinstance(value, dict):
         out += ["%s is missing %s" % (where, k) for k in schema.get("required", []) if k not in value]
-        for k, sub in schema.get("properties", {}).items():
+        props = schema.get("properties", {})
+        for k, sub in props.items():
             if k in value:
                 out += validate(value[k], sub, "%s.%s" % (where, k))
+        if schema.get("additionalProperties") is False:
+            out += ["%s has a key the schema does not allow: %s" % (where, k) for k in value if k not in props]
     if isinstance(value, list) and "items" in schema:
         for i, v in enumerate(value):
             out += validate(v, schema["items"], "%s[%d]" % (where, i))
@@ -68,9 +82,19 @@ def validate(value, schema, where="$"):
 def _check_schema(s, where="$"):
     if not isinstance(s, dict):
         raise ValueError("invalid schema: %s is not an object" % where)
+    unknown = sorted(set(s) - KEYWORDS)
+    if unknown:  # spec 8.4: a keyword the validator does not enforce is refused before any launch
+        raise ValueError("invalid schema: %s uses %s, which agy-call does not enforce; it supports %s"
+                         % (where, ", ".join(unknown), ", ".join(sorted(KEYWORDS))))
     t = s.get("type")
-    if t is not None and (not isinstance(t, str) or t not in _NAMES):
+    names = t if isinstance(t, list) else [t]
+    if t is not None and not (names and all(isinstance(n, str) and n in _NAMES for n in names)):
         raise ValueError("invalid schema: unknown type %r at %s" % (t, where))
+    if s.get("additionalProperties", False) is not False:
+        raise ValueError("invalid schema: additionalProperties at %s must be false" % where)
+    for k in ("minLength", "minimum", "maximum"):
+        if k in s and (isinstance(s[k], bool) or not isinstance(s[k], (int, float))):
+            raise ValueError("invalid schema: %s at %s must be a number" % (k, where))
     if "required" in s and not isinstance(s["required"], list):
         raise ValueError("invalid schema: required at %s must be a list" % where)
     if "enum" in s and not isinstance(s["enum"], list):
