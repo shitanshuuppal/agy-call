@@ -79,6 +79,7 @@ agy adds the Antigravity app's shared grants (`userSettings.globalPermissionGran
 A shared grant that is a prefix of one of the task's commands (a shared `command(git)` against the task's `command(git status)`) then blocks that command too; the task is refused on the safe side, and Gemini reports it as a `NEED:` line.
 When that file cannot be read as JSON of the expected shape, `task` refuses to start (exit 2).
 agy's `--sandbox` flag did not stop a granted command from writing outside the workspace when measured, so agy-call does not use it and `--sandbox` does not contain commands.
+The grant also turns off agy's access outside the workspace (`allowNonWorkspaceAccess: false`), because agy otherwise follows the global `allowNonWorkspaceAccess` setting, which a per-job `--settings` file does not replace.
 The grant keeps agy's own file-writing tool inside the worktree, but agy-call cannot limit what a granted command does: a test command runs the repository's code, which can do anything your account can, and git commands follow the repository's own configuration.
 
 ### When a task ends

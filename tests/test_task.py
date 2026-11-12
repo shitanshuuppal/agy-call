@@ -558,6 +558,13 @@ def test_a_queued_continuation_with_a_live_worker_is_still_refused(repo, fake):
     assert task.segments(job) == [1, 2]
 
 
+def test_every_task_launch_turns_off_non_workspace_access(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
+    bounded(lambda: task.drive(_start()))
+    assert launches()[0]["settings"]["allowNonWorkspaceAccess"] is False
+
+
 def test_a_successful_check_cannot_outlast_the_segment_deadline(repo, fake):
     set_turns, launches = fake
     set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))

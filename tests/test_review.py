@@ -182,6 +182,7 @@ def test_a_review_runs_in_its_snapshot_with_the_read_only_grant_and_the_schema(r
     assert os.path.realpath(first["cwd"]) == os.path.realpath(rv["worktree"])
     assert first["settings"]["permissions"] == {"allow": ["command(%s)" % c for c in task.READ_ONLY],
                                                 "deny": ["command(gcloud run)"]}
+    assert first["settings"]["allowNonWorkspaceAccess"] is False
     argv = first["argv"]
     assert argv[argv.index("--json-schema") + 1] == rv["schema"] and argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--settings") + 1] == rv["grant"] and "--conversation" not in argv

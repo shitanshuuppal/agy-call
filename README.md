@@ -44,6 +44,7 @@ Claude never starts a fix or a second review by itself after a review; that foll
 Each task gets its own permission grant, passed to agy with `--settings`, so you never edit agy's own settings to let a task run.
 The grant lets agy's file-writing tool write only inside the task's worktree, and lets Gemini run a fixed set of read-only commands (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `git status`, `git diff`, `git log`, `git show`) plus the build and test commands Claude chose for that task.
 A review's grant has the read-only commands only.
+The grant also turns off agy's access outside the workspace (`allowNonWorkspaceAccess: false`), because agy otherwise follows the global `allowNonWorkspaceAccess` setting, which a per-job `--settings` file does not replace.
 agy adds the Antigravity app's shared grants (`userSettings.globalPermissionGrants.allow` in `~/.gemini/config/config.json`) to every run that uses `--settings`, so agy-call lists each shared grant that is not one of the task's own entries in the grant's `deny` list, and agy refuses those for the task.
 agy-call cannot limit what a granted command does: a test command runs the repository's own code, which can do anything your account can, and git commands follow the repository's own configuration.
 agy's `--sandbox` flag did not stop a granted command from writing outside the workspace when measured, so agy-call does not use it.

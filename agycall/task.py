@@ -71,7 +71,8 @@ def grant(worktree, allow):
     grant that is not exactly one of these goes in deny, which agy checks before allow. A review passes no worktree and
     no --allow entries, so its grant is the read-only commands alone."""
     own = (["write_file(%s)" % worktree] if worktree else []) + ["command(%s)" % c for c in commands(allow)]
-    return {"permissions": {"allow": own, "deny": list(dict.fromkeys(g for g in shared_grants() if g not in own))}}
+    return {"permissions": {"allow": own, "deny": list(dict.fromkeys(g for g in shared_grants() if g not in own))},
+            "allowNonWorkspaceAccess": False}  # a --settings file replaces only permissions; agy keeps the global value otherwise
 
 
 def write_grant(path, worktree, allow):
