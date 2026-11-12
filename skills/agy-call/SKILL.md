@@ -69,7 +69,7 @@ from agycall import call, batch, AgyCallError, Quota
 `check` is a Python function that receives the parsed value (or the text) and returns a list of problems; it needs a stable `check_id` string, which is part of the job's identity, so change the `check_id` when the function's rules change.
 `batch(jobs, *, workers=4, **common)` takes a list of dicts as in the JSONL format and returns `{job_id: Result or exception}`; it never raises for a single job.
 
-Exceptions, all subclasses of `AgyCallError` with the CLI exit code in `.code`: `Running` (25), `Mismatch` (24), `Quota` (10, with `.key` and `.until`), `Fatal` (the failure's exit code, with `.reason`), `GaveUp` (20, with `.findings`, `.conversation`, `.usage`, `.job_dir`), `CheckError` (21), `NoConversation` (23), `Cancelled` (27).
+Exceptions, all subclasses of `AgyCallError` with the CLI exit code in `.code`: `Running` (25), `Mismatch` (24), `Quota` (10, with `.key` and `.until`), `Fatal` (the failure's exit code, with `.reason`), `GaveUp` (20, with `.findings`, `.conversation`, `.usage`, `.job_dir`), `CheckError` (21), `NoConversation` (23), `RepoState` (26), `Cancelled` (27), `Blocked` (28, with `.findings`).
 
 ## Job ids and stores
 
@@ -80,13 +80,16 @@ Keep the store inside the project (for example `<project>/agy-jobs`) so the repl
 
 ## Status, result and cancel
 
-`agy-call status [JOB] [--store DIR] [--namespace NAME]` lists the jobs of a store, one line each: the id, the state, the age and the last finding.
+`agy-call status [JOB] [--all] [--store DIR] [--namespace NAME]` lists the jobs of a store, one line each: the id, the state, the kind (`run` or `task`), the age and the last finding.
+Without `--store` or `--namespace`, `status`, `result` and `cancel` use the task store of the current git repository when they run inside one (a task's worktree counts), and the default store otherwise; pass `--namespace default` for `run` jobs of the default store from inside a repository.
+`--all` lists every store under `~/.agy-call/jobs`, repository stores and namespace stores, one block per store.
 Jobs started in the current Claude session (the `AGYCALL_SESSION` variable, recorded in `request.json`) come first, then the others, newest first in each group.
 With a job id it prints every field of the job's `status.json` and the processes still running for it: the controller (the agy-call process running the job), agy and the check command.
 A queued, running or checking job with none of these alive lost its process; rerun the same command to recover it.
 
 `agy-call result [JOB]` prints the accepted answer of a `done` job and exits 0.
-For any other state it prints the state, the findings and the last saved reply, and exits with that state's code: 10 quota, 20 failed, 21 check error, 23 no conversation, 25 queued, running or checking, 27 cancelled, and for `fatal` the setup code the job recorded (11, 13, 14 or 22).
+For any other state it prints the state, the findings and the last saved reply, and exits with that state's code: 10 quota, 20 failed, 21 check error, 23 no conversation, 25 queued, running or checking, 27 cancelled, 28 blocked, and for `fatal` or `setup-error` the setup code the job recorded (11, 13, 14 or 22).
+For a task it then prints the hand-back (see Coding tasks).
 An `interrupted` job exits 1.
 Without a job id it uses the newest finished job of the current session.
 
@@ -112,7 +115,9 @@ Replies already received are kept.
 | `quota` | a quota hold stopped the job |
 | `check-error` | the check itself failed to run |
 | `no-conversation` | a follow-up was needed but no conversation id was captured |
+| `blocked` | a task's reply had `NEED:` lines or agy refused an action (exit 28); waiting for a wider grant |
 | `fatal` | agy is missing or not signed in, the model is unknown, or agy's output was not a JSON envelope |
+| `setup-error` | the same as `fatal`, for a task |
 | `cancelled` | stopped by `cancel` |
 | `interrupted` | the process running the job died and the saved output did not settle the turn; the rerun that found it restarts the turn |
 
@@ -131,7 +136,9 @@ Replies already received are kept.
 | 23 | no conversation id was captured, so a follow-up cannot be sent |
 | 24 | the job exists with a different request |
 | 25 | the job is running in another process; from `result`, the job is still queued, running or checking; from `cancel`, it is still stopping |
+| 26 | repository state: not inside a git repository, uncommitted or untracked files, a detached HEAD, a missing worktree, or a merge, cleanup or discard that the repository's state refuses |
 | 27 | the job was cancelled |
+| 28 | a task is blocked on permission: its reply had `NEED:` lines or agy refused an action |
 
 An error that is not one of these (for example a bad argument) exits with 1 or 2.
 
@@ -147,6 +154,7 @@ A cancelled job has `cancel.request`, and a background job has `background.json`
 When the process running a job died, the next run of the same job reads the saved `agy.out` before launching anything.
 A complete reply found there is checked as if it had just arrived, but agy's exit status was lost, so it is accepted only by a check you asked for and no follow-up is sent after it.
 Output that is not a complete reply restarts the turn.
+A task's record is `~/.agy-call/jobs/<repo id>/<job>/`; beside the files above it holds `grant-<n>.json` (the grant passed with `--settings`), `segments/NNN.json` (each segment's prompt, grant and budget), `segments/NNN-answer.txt` (an earlier segment's answer), and `merge.json`, `merge-failed.json` and `cleanup.json` once those commands ran.
 
 ## What to do per exit
 
@@ -156,21 +164,89 @@ Output that is not a complete reply restarts the turn.
 - 23: rerun with `--fresh` if starting a new conversation is acceptable; otherwise use the replies saved under `attempts/`.
 - 24: the request changed; use a new job id, or `--new-version` to replace the old job.
 - 25: another process holds the job; wait for it and rerun, which then returns its answer.
+- 26: the repository is not in the state the command needs; the message says what to change (commit, stash or ignore files, check out a branch, merge the base into the task branch, or clean up a task before `--new-version`).
 - 27: the job was cancelled and stays cancelled; its replies are kept under `attempts/`; to do the work anyway, run it under a new job id.
+- 28: read the `NEED:` lines and the refused action kinds (`agy-call status JOB`), then follow "After `blocked`" under Coding tasks.
 - 11, 13, 14, 22: fix the setup (login, install, model name) and rerun; the job is kept.
 
 ## Coding tasks
 
-In a headless run agy can write files and run commands only where `~/.gemini/antigravity-cli/settings.json` allows it; any other write or command is denied, and agy-call exits 20 after the second denial.
-The rules go in `permissions.allow`, for example `write_file(/path/to/worktree)`, `command(swift test)` or `command(regex:npm run (build|lint|test))`; a `deny` rule wins over an allow rule.
-Only the user can add these rules, because Claude Code blocks a session from editing agy's settings; before launching, give the user the exact lines to add.
-Run the task in its own git worktree on its own branch, and grant `write_file` for that worktree only.
-Ask Gemini to write the changes in place and to end with a reply of a few lines listing the files changed and anything not done; do not ask for a diff or file contents in the reply.
+`agy-call task` hands a coding task to Gemini in its own git worktree on a new branch `agy/<job>`, with a permission grant made for that task only; use it instead of `run` for any work that edits files.
+Run it from inside the repository:
+
+```
+agy-call task --job ID --model M [--effort E] [--allow CMD]... --check-cmd CMD [--check-timeout S] [--timeout T] [--max-turns N] [--deadline T] [--background] [--new-version] --prompt-file F
+```
+
+- It refuses with exit 26 while the checkout has staged, unstaged or untracked files that are not ignored, or a detached HEAD, and with exit 24 when the branch `agy/<job>` or the worktree folder already exists for another job.
+- The job id follows the job id rule and must also make a branch name git accepts, so ids such as `a..b`, `a.lock` or `a.` exit 2.
+- The worktree is `~/.agy-call/worktrees/<repo id>/<job>/` and the job record `~/.agy-call/jobs/<repo id>/<job>/`, where `<repo id>` is the first 12 hex characters of the SHA-256 of the repository's git common directory; both folders are readable by you only.
+- `--check-cmd` is required; pass `--check-cmd true` when there is nothing to build or test.
+  It runs in the worktree with Gemini's reply on stdin; exit 0 passes, and any other exit sends the last 4000 characters of its combined stdout and stderr back to Gemini as a fix turn in the same conversation.
+  A turn that changed no file fails the check with "no file in the worktree changed".
+  Only a timeout or a failure to start the check is a check error (21) [`--check-timeout` 600 seconds].
+- `--max-turns` counts every launch, follow-ups and retries included [3]; `--deadline` bounds the whole run across turns [`2h`]; `--timeout` limits one turn [`60m`].
+- Gemini receives your task text inside fixed instructions: the worktree path, the exact commands it may run, no commits, branches or pushes, one `NEED: <command>` line instead of trying a command that is not allowed, and a final summary of at most 15 lines without diffs or file contents.
+- `--background` prints the job id and runs the task in a detached worker; follow it with `agy-call status` and `agy-call result JOB`.
+- Run in the foreground, `task` prints the hand-back (see below) and exits with the job's code; this holds after a recorded failure too, such as a failed check or a quota stop, so the worktree and the last reply are shown either way.
+
+### What the grant allows
+
+agy-call writes `grant-<n>.json` in the job record and passes it to agy with `--settings`.
+It allows writes inside the worktree, the read-only commands `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `git status`, `git diff`, `git log` and `git show`, and each `--allow` entry as `command(<entry>)`.
+An `--allow` entry is one command without newlines or parentheses, for example `--allow "swift build" --allow "swift test"`; a compound command such as `swift build && swift test` runs when each part is allowed.
+agy adds the Antigravity app's shared grants (`userSettings.globalPermissionGrants.allow` in `~/.gemini/config/config.json`) to every `--settings` run, so agy-call puts every shared grant that is not one of the task's own entries into the grant's `deny` list, and reads the file again each time a task runs.
+A shared grant that is a prefix of one of the task's commands (a shared `command(git)` against the task's `command(git status)`) then blocks that command too; the task is refused on the safe side, and Gemini reports it as a `NEED:` line.
+When that file cannot be read as JSON of the expected shape, `task` refuses to start (exit 2).
+The grant keeps agy's own file-writing tool inside the worktree, but agy-call cannot limit what a granted command does: a test command runs the repository's code, which can do anything your account can, and git commands follow the repository's own configuration.
+
+### When a task ends
+
+- `done` (exit 0): agy-call prints the hand-back: Gemini's summary, `git status --porcelain` and `git diff --stat <base commit>` of the worktree, the worktree path, the branch and the base.
+- `blocked` (exit 28): Gemini's reply had `NEED:` lines, or agy refused an action.
+  Any refusal that includes a file write blocks at once.
+  When agy refused only commands and the reply named none, agy-call first asks once, in the same conversation, for the `NEED:` lines; that turn counts against `--max-turns`.
+  `status.json` records the refused action kinds (`denied`) and the `NEED:` lines (`need`), and agy-call never widens a grant by itself.
+- `failed` (exit 20): the check still failed after `--max-turns`, the deadline passed, a turn timed out (its partial reply is kept), agy returned no reply even to the one turn that asks only for the summary, or a reply that came with an agy error failed the check.
+- `setup-error` (exit 11, 13, 14 or 22): agy is not signed in or missing, the model is unknown, or agy's output was not a JSON envelope.
+- A rerun of the same `task` command returns the saved result, or continues the conversation after a quota stop; it creates nothing and does not need a clean checkout.
+  A different request under the same job id exits 24.
+- When the process running a task died and its saved output does not settle the turn, the task ends `failed` and nothing is resent.
+
+### Continuing a task
+
+```
+agy-call task --continue --job ID [--allow CMD]... [--max-turns N] [--deadline T] [--background] --prompt-file F
+```
+
+It sends a new message in the task's own conversation, in the same worktree, with its own `--max-turns` and `--deadline`; agy's own `--continue` flag, which picks the machine's most recent conversation, is never used.
+`--allow` adds commands for this and later messages, in a new grant file.
+The previous answer moves to `segments/NNN-answer.txt`, and a pending `cancel.request` is set aside, so neither ends the new turns.
+It exits 25 while the task runs or while an earlier continuation is still queued for its worker, 26 when its worktree is missing, and 23 when the task never got a conversation id.
+
+After `blocked`: you may continue with `--allow <command>` for build, test or read commands confined to the repository.
+Ask the user first for anything that reaches outside it: network access, deletion outside the worktree, package installs, `git push`, or credentials.
+
+### Hand-back and merge
+
+1. Read the diff in the worktree and run the build and tests there yourself.
+2. Commit on `agy/<job>` in the worktree with the user's git identity and a message naming the job.
+3. Run `agy-call task --merge JOB` from the repository.
+4. Never push.
+
+`--merge` takes the job lock (exit 25 while the task runs) and the repository lock.
+It refuses with exit 26 when the worktree has uncommitted changes, when the main checkout is not on the base branch or not clean, when the branch has no commit that the base branch lacks, or when the base branch moved on; in that last case merge the base branch into `agy/<job>`, test, commit and run `--merge` again.
+It runs the check command on the branch tip in the worktree; a failing check exits 20 with its output, and a check that changes the worktree or the branch exits 26.
+It then runs `git merge --no-ff -m "Merge agy task <job>"` in the main checkout; when git fails (for example a hook refuses), it saves git's output in `merge-failed.json`, runs `git merge --abort`, and exits 26.
+It writes `merge.json` once it has confirmed the merge commit.
+
+`agy-call task --cleanup JOB` removes the worktree and deletes the branch once the branch is merged into the base branch.
+`agy-call task --discard JOB` drops a task, merged or not, when its worktree has no uncommitted changes.
+Neither passes `--force` to git or runs while the task runs, and ignored files such as build output do not stop them.
+The job record is kept, and `task --new-version` starts the same job id again only after `--cleanup` or `--discard` (otherwise exit 26).
+
 A turn's reply and its thinking share one output limit, so a reply that carries a long diff can hit it; agy then fails with "exceeded the output token limit", and later turns in that conversation have failed the same way.
 agy-call still checks a reply agy wrote before that error (it is in `reply.txt`); when there is none, it exits 20 without resending.
-A reply that comes back with an agy error is accepted only by a check you asked for (`--expect`, `--require`, `--schema` or `--check-cmd`), and no follow-up is sent in that conversation.
-Pass a `--check-cmd` that builds and runs the tests in the worktree and ignores stdin when the reply is only a summary; a failing build then goes back to Gemini in the same conversation as a finding.
-Give the check a `--check-timeout` long enough for the build, give the call a `--timeout` that covers the whole task (a coding turn can run an hour), and run agy-call with run_in_background.
 In shell scripts pass each option and its value as separate words: `--conversation "$ID"`, not one string holding both.
 
 ## Multi-turn work
