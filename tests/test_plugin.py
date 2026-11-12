@@ -54,3 +54,22 @@ def test_the_shipped_text_has_no_em_dash_and_no_banned_word():
         text = read(path)
         assert "\u2014" not in text, path
         assert not banned.search(text), path
+
+
+def test_the_skill_is_used_only_when_the_user_asks_and_covers_every_command():
+    fm = front_matter("skills", "agy-call", "SKILL.md")
+    assert fm["name"] == "agy-call"
+    assert "only when the user asks" in fm["description"]
+    text = read("skills", "agy-call", "SKILL.md")
+    for name in COMMANDS:
+        assert "/agy:%s" % name in text, name
+    for heading in ("## Coding tasks", "## Reviews", "## Status, result and cancel", "## Setup", "## run and batch",
+                    "## Exit codes", "## Where replies are", "### Job states"):
+        assert "\n%s\n" % heading in text, heading
+
+
+def test_the_readme_and_release_notes_give_the_new_install_line():
+    for path in ("README.md", "docs/release-notes-0.2.0.md"):
+        text = read(path)
+        assert "/plugin install agy --marketplace shitanshuuppal/agy-call" in text, path
+        assert "/plugin uninstall agy-call@agy-call" in text, path
