@@ -508,7 +508,7 @@ def _drive(c, max_turns, ignore_quota, fresh):
             job.set_status(state="quota")
             raise
         att = job.new_attempt()
-        job.set_status(state="running", attempts=len(job.launched()) + 1, conversation=c.conv)
+        job.set_status(state="running", attempts=len(job.launched()), conversation=c.conv)
         try:
             oc = _launch(c, att, message, kind, generation)
         except Fatal as e:

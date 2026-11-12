@@ -8,7 +8,7 @@ import sys
 from . import control, task
 from . import store as st
 from .batch import batch
-from .errors import AgyCallError, Cancelled, Quota
+from .errors import AgyCallError, Cancelled, Quota, RepoState, Running
 from .runner import call
 
 
@@ -83,7 +83,12 @@ def _task(a):
     job = task.start(a.job, text, model=a.model, check_cmd=a.check_cmd, allow=a.allow, effort=a.effort,
                      check_timeout=a.check_timeout, timeout=a.timeout, max_turns=a.max_turns, deadline=a.deadline,
                      new_version=a.new_version)
-    task.drive(job)
+    try:
+        task.drive(job)
+    except (Running, RepoState):  # nothing ran: the job is held elsewhere, or its worktree is gone
+        raise
+    except AgyCallError as e:  # a recorded failure: hand back the worktree, its branch and the last reply as well
+        print("agy-call: %s" % e, file=sys.stderr)
     return control.result(job.store, job.id)
 
 

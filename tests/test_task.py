@@ -15,7 +15,7 @@ AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
 
 
 def run_cli(*args, **kw):
-    return subprocess.run([sys.executable, AGYCALL, *args], capture_output=True, text=True, timeout=60, **kw)
+    return subprocess.run([sys.executable, AGYCALL, *args], capture_output=True, text=True, timeout=30, **kw)
 
 
 def _config(tmp_path, allow):
@@ -201,3 +201,25 @@ def test_cli_task_prints_the_hand_back(repo, fake, tmp_path):
     assert r.returncode == 2 and "branch name" in r.stderr
     r = run_cli(*base, "--job", "t3", "--check-cmd", "true", cwd=str(tmp_path))
     assert r.returncode == 26 and "not inside a git repository" in r.stderr
+
+
+def test_the_attempt_counter_equals_the_attempt_folders(repo, fake):
+    set_turns, _ = fake
+    set_turns(reply("Wrote b.", write={"b.txt": "wrong\n"}), reply("Fixed b.", write={"b.txt": "b\n"}))
+    job = _start(check_cmd="grep -q '^b$' b.txt")
+    task.drive(job)
+    assert job.status()["attempts"] == len(job.launched()) == 2
+    job2 = _start("t2")  # the last turn repeats, and it writes b.txt
+    task.drive(job2)
+    assert job2.status()["attempts"] == len(job2.launched()) == 1
+
+
+def test_cli_task_hands_back_a_failed_task(repo, fake, tmp_path):
+    set_turns, _ = fake
+    set_turns(reply("Wrote b.", write={"b.txt": "wrong\n"}))
+    (tmp_path / "task.md").write_text("Add b.txt.")
+    r = run_cli("task", "--model", "m", "--prompt-file", str(tmp_path / "task.md"), "--job", "t1", "--max-turns", "2",
+                "--check-cmd", "grep -q '^b$' b.txt", cwd=str(repo))
+    assert r.returncode == 20, r.stderr
+    assert "worktree: %s\nbranch: agy/t1\n" % _wt() in r.stdout and "?? b.txt" in r.stdout
+    assert "last reply" in r.stdout and "Wrote b." in r.stdout
