@@ -1,5 +1,7 @@
+import datetime as dt
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -8,7 +10,7 @@ import pytest
 
 from agycall import agy, quota, runner, store
 from agycall.errors import CheckError, Fatal, GaveUp, Mismatch, NoConversation, Quota, Running
-from agyturns import auth_error, empty, denied, error_reply, malformed, model_error, partial, quota_error, reply
+from agyturns import auth_error, empty, denied, error_reply, malformed, model_error, partial, quota_error, reply, wait_for
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -338,10 +340,12 @@ def test_locks_outlive_a_killed_caller(tmp_path, fake):
     th.join(timeout=30)
     assert not th.is_alive()  # a regression fails here instead of hanging the suite
     assert time.monotonic() - t0 >= 2.0  # waited for the orphaned delegate's conversation lock
-    r = runner.call("j1", "q", store=S(tmp_path), model="m", conversation="cX")
+    with pytest.raises(GaveUp) as e:  # the orphaned agy's reply is recovered, but its exit status was lost
+        runner.call("j1", "q", store=S(tmp_path), model="m", conversation="cX")
     att = store.Job(S(tmp_path), "j1").launched()[0]
-    assert store.read_json(os.path.join(att, "result.json"))["outcome"] == "interrupted"
-    assert "from the beginning" in launches()[2]["prompt"] and r.answer == "ok"
+    res = store.read_json(os.path.join(att, "result.json"))
+    assert res["classified"] == "reply-with-error" and res["recovered"] is True
+    assert "only by a check" in str(e.value) and len(launches()) == 2  # nothing was resent
 
 
 def test_answer_is_saved_before_the_accepted_result(tmp_path, fake, monkeypatch):
@@ -381,7 +385,7 @@ def test_retry_after_agy_output_does_not_start_a_new_conversation(tmp_path, fake
 
 def test_conversation_id_stranded_in_result_json(tmp_path, fake):
     set_turns, launches = fake
-    set_turns(GOOD)
+    set_turns(reply(GOOD["response"], "c5"))
     job = store.Job(S(tmp_path), "j1")
     os.makedirs(job.dir, exist_ok=True)
     store.write_atomic(job.path("request.json"), {"identity": store.identity("q", "m", os.path.abspath(os.getcwd()), [], None,
@@ -587,3 +591,131 @@ def test_saved_answer_is_returned_even_if_the_prompt_limit_shrinks(tmp_path, fak
     monkeypatch.setattr(agy, "MAX_PROMPT", 1000)
     assert runner.call("j1", "x" * 1500, store=S(tmp_path), model="m").answer == "ok"
     assert len(launches()) == 1
+
+
+def _cident(cmd=None):
+    return {"json": False, "require": [], "schema": None, "cmd": cmd, "check_id": None}
+
+
+def _pending(tmp_path, out, check_cmd=None, started=None, conversation=None):
+    """A job whose controller died after agy exited: launch.json and agy.out, but no result.json."""
+    job = store.Job(S(tmp_path), "j1")
+    os.makedirs(job.dir, exist_ok=True)
+    store.write_atomic(job.path("request.json"), {"identity": store.identity(
+        "q", "m", os.path.abspath(os.getcwd()), [], conversation, _cident(check_cmd), None)})
+    dead = subprocess.Popen(["true"], start_new_session=True)
+    dead.wait()
+    att = job.new_attempt()
+    store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "q",
+                                                         "conversation": conversation, "generation": 0,
+                                                         "started": started or runner._now()})
+    with open(os.path.join(att, "agy.out"), "wb") as fh:
+        fh.write(out)
+    open(os.path.join(att, "agy.err"), "w").close()
+    return job, att
+
+
+def _env(response, conv="c7", status="SUCCESS"):
+    return json.dumps({"status": status, "response": response, "conversation_id": conv}).encode("utf-8")
+
+
+def test_recovered_reply_is_accepted_by_a_passing_check(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(GOOD)
+    _, att = _pending(tmp_path, _env("the reply"), check_cmd="grep -q reply")
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd="grep -q reply")
+    assert r.answer == "the reply" and r.conversation == "c7" and launches() == []
+    res = store.read_json(os.path.join(att, "result.json"))
+    assert res["classified"] == "reply-with-error" and res["recovered"] is True and res["outcome"] == "accepted"
+    assert "exit status" in res["agyError"]
+    assert open(os.path.join(att, "reply.txt")).read() == "the reply"
+
+
+def test_recovered_reply_failing_its_check_sends_no_follow_up(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(GOOD)
+    _pending(tmp_path, _env("the reply"), check_cmd="exit 1")
+    for _ in range(2):  # a rerun keeps the stop
+        with pytest.raises(GaveUp) as e:
+            runner.call("j1", "q", store=S(tmp_path), model="m", check_cmd="exit 1")
+        assert "no follow-up was sent" in str(e.value)
+    assert launches() == []
+
+
+def test_truncated_output_is_interrupted_and_the_turn_restarts(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply("full answer", "c7"))
+    job, att = _pending(tmp_path, b'{"status": "SUCC', conversation="c7")
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", conversation="c7")
+    assert r.answer == "full answer" and store.read_json(os.path.join(att, "result.json"))["outcome"] == "interrupted"
+    assert "from the beginning" in launches()[0]["prompt"]
+    assert launches()[0]["argv"][launches()[0]["argv"].index("--conversation") + 1] == "c7"
+
+
+def test_incomplete_output_after_the_deadline_is_a_timeout(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply("full answer", "c7"))
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat()
+    _, att = _pending(tmp_path, b"", started=old, conversation="c7")
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", conversation="c7")
+    res = store.read_json(os.path.join(att, "result.json"))
+    assert res["outcome"] == "timeout" and res["recovered"] is True and r.answer == "full answer"
+    assert "from the beginning" in launches()[0]["prompt"]
+
+
+def test_reply_in_another_conversation_stops_the_job(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply("ok", "c2"))
+    with pytest.raises(GaveUp) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m", conversation="c1")
+    assert "agy answered in conversation c2 instead of c1" in str(e.value)
+    job = store.Job(S(tmp_path), "j1")
+    assert job.status()["state"] == "failed" and not os.path.exists(job.path("answer.txt"))
+    assert store.read_json(os.path.join(job.launched()[0], "result.json"))["conversationConflict"] == "c2"
+    with pytest.raises(GaveUp):
+        runner.call("j1", "q", store=S(tmp_path), model="m", conversation="c1", max_turns=8)
+    assert len(launches()) == 1
+
+
+def test_check_runs_in_the_job_cwd_while_the_job_shows_checking(tmp_path, fake):
+    set_turns, _ = fake
+    set_turns(reply("x"))
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "marker").write_text("")
+    status = os.path.join(S(tmp_path), "j1", "status.json")
+    cmd = "test -f marker && grep -q '\"state\": \"checking\"' " + shlex.quote(status)
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", cwd=str(work), check_cmd=cmd)
+    rec = store.read_json(os.path.join(store.Job(S(tmp_path), "j1").launched()[0], "check.json"))
+    assert r.answer == "x" and rec["pid"] == rec["pgid"] and rec["pstart"]
+
+
+def test_check_left_running_by_a_killed_controller_blocks_then_runs_again(tmp_path, fake, monkeypatch):
+    import signal
+    set_turns, launches = fake
+    set_turns(reply("the reply", "c1"))
+    flag = tmp_path / "flag"
+    monkeypatch.setenv("FLAGFILE", str(flag))
+    cmd = 'test -f "$FLAGFILE" || sleep 30; grep -q reply'
+    code = ("import sys; sys.path.insert(0, %r); from agycall import runner; "
+            "runner.call('j1', 'q', store=%r, model='m', cwd=%r, check_cmd=%r)" % (os.path.dirname(HERE), S(tmp_path), str(tmp_path), cmd))
+    p = subprocess.Popen([sys.executable, "-c", code], env=dict(os.environ))
+    job = store.Job(S(tmp_path), "j1")
+
+    def check_rec():
+        atts = job.launched()
+        return store.read_json(os.path.join(atts[0], "check.json")) if atts else None
+
+    rec = wait_for(check_rec)
+    os.kill(p.pid, signal.SIGKILL)
+    p.wait(timeout=10)
+    try:
+        with pytest.raises(Running):  # the orphaned check still holds the job lock
+            runner.call("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), check_cmd=cmd)
+    finally:
+        assert agy.stop_group(rec["pgid"])
+    flag.write_text("")
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), check_cmd=cmd)
+    assert r.answer == "the reply" and len(launches()) == 1
+    res = store.read_json(os.path.join(job.launched()[0], "result.json"))
+    assert res["recovered"] is True and res["outcome"] == "accepted"

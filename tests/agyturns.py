@@ -1,4 +1,6 @@
-"""Builders for tests/fake_agy.py turns, one per shape of agy run the classifier knows."""
+"""Builders for tests/fake_agy.py turns, one per shape of agy run the classifier knows, and a bounded wait for tests
+that drive real processes."""
+import time
 
 CUT_OFF = ("Your previous response was cut off because it exceeded the output token limit\n"
            "Please continue from where you left off, keeping your response shorter\nRetries remaining: 3")
@@ -41,3 +43,14 @@ def model_error(name="m"):
 
 def malformed(raw=b"", stderr="flag provided but not defined: -zzz\n", exit=2):
     return {"exit": exit, "raw_hex": raw.hex(), "stderr": stderr}
+
+
+def wait_for(predicate, timeout=30):
+    """Poll predicate until it returns something truthy and return that; fail after timeout seconds."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise AssertionError("condition not met within %s seconds" % timeout)
