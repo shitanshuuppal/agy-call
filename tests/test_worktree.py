@@ -1,11 +1,18 @@
 import os
 import stat
+import subprocess
+import sys
+import threading
+import time
 
 import pytest
 
-from agycall import store, worktree
-from agycall.errors import Mismatch, RepoState
-from agyturns import bounded, git
+from agycall import control, store, task, worktree
+from agycall.errors import Mismatch, RepoState, Running
+from agyturns import bounded, git, reply
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AGYCALL = os.path.join(os.path.dirname(HERE), "bin", "agy-call")
 
 
 def _repo(*a):
@@ -78,3 +85,136 @@ def test_task_ids_must_make_a_branch_name_git_accepts():
     for bad in ("a..b", "a.lock", "a.", "-x", "a/b", ""):
         with pytest.raises(ValueError):
             bounded(lambda bad=bad: worktree.check_job_id(bad))
+
+
+def _committed_task(fake, job_id="t1", check="test -f b.txt", files=None):
+    """A task that ended done, with its work committed on agy/<job> the way the skill tells Claude to."""
+    set_turns, _ = fake
+    set_turns(reply("Created b.txt.", write=files or {"b.txt": "b\n"}))
+    job = task.start(job_id, "Add b.txt.", model="m", check_cmd=check)
+    task.drive(job)
+    wt = worktree.worktree_path(worktree.repo(), job_id)
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "agy task %s" % job_id)
+    return job, wt
+
+
+def test_merge_makes_the_merge_commit_and_cleanup_removes_the_worktree_and_branch(repo, fake):
+    job, wt = _committed_task(fake, check="mkdir -p build && touch build/out.o && test -f b.txt")
+    base_tip, task_commit = git(repo, "rev-parse", "main").strip(), git(wt, "rev-parse", "HEAD").strip()
+    text, code = worktree.merge("t1")  # the check leaves ignored build output in the worktree: still clean
+    head = git(repo, "rev-parse", "main").strip()
+    assert code == 0 and head in text and (repo / "b.txt").exists()
+    assert git(repo, "rev-list", "--parents", "-n", "1", head).split() == [head, base_tip, task_commit]
+    assert git(repo, "log", "-1", "--format=%s").strip() == "Merge agy task t1"
+    m = store.read_json(job.path("merge.json"))
+    assert (m["taskCommit"], m["mergeCommit"], m["baseTip"], m["checkExit"]) == (task_commit, head, base_tip, 0)
+    assert "merged into main as %s" % head in control.result(job.store, "t1")[0]
+    assert os.path.exists(os.path.join(wt, "build", "out.o"))
+    assert worktree.cleanup("t1")[1] == 0  # ignored build output does not stop the removal
+    assert not os.path.exists(wt) and git(repo, "branch", "--list", "agy/t1") == ""
+    assert store.read_json(job.path("cleanup.json"))["action"] == "cleanup"
+    assert "removed by task --cleanup" in control.result(job.store, "t1")[0]
+    assert worktree.cleanup("t1") == ("task t1 was already removed by --cleanup", 0)
+    task.start("t1", "Add c.txt.", model="m", check_cmd="true", new_version=True)  # allowed once cleaned up
+    assert os.path.isdir(wt) and os.path.isdir(os.path.join(job.store, ".versions", "t1", "v1"))
+
+
+def test_merge_refuses_until_the_task_and_the_main_checkout_are_ready(repo, fake):
+    job, wt = _committed_task(fake)
+    with store.flock(job.lock_path):
+        with pytest.raises(Running):
+            worktree.merge("t1")
+    open(os.path.join(wt, "x.txt"), "w").close()
+    with pytest.raises(RepoState, match="uncommitted changes; commit them on agy/t1"):
+        worktree.merge("t1")
+    os.remove(os.path.join(wt, "x.txt"))
+    git(repo, "checkout", "-q", "-b", "other")
+    with pytest.raises(RepoState, match="not on main"):
+        worktree.merge("t1")
+    git(repo, "checkout", "-q", "main")
+    (repo / "y.txt").write_text("y")
+    with pytest.raises(RepoState, match="main checkout .* has uncommitted"):
+        worktree.merge("t1")
+    git(repo, "add", "y.txt")
+    git(repo, "commit", "-q", "-m", "the base moves on")
+    with pytest.raises(RepoState, match="base moved: merge main into agy/t1, test, commit, and run --merge again"):
+        worktree.merge("t1")
+    assert not os.path.exists(job.path("merge.json"))
+    git(wt, "reset", "-q", "--hard", git(wt, "rev-parse", "HEAD~1").strip())  # the task commit undone
+    git(wt, "merge", "-q", "main")
+    with pytest.raises(RepoState, match="no commit that main does not have"):
+        worktree.merge("t1")
+
+
+def test_a_failing_check_or_one_that_edits_tracked_files_refuses_the_merge(repo, fake):
+    job, wt = _committed_task(fake, check="test -f b.txt && test ! -f stop")
+    open(os.path.join(wt, "stop"), "w").close()
+    git(wt, "add", "stop")
+    git(wt, "commit", "-q", "-m", "stop")
+    before = git(repo, "rev-parse", "main").strip()
+    text, code = worktree.merge("t1")
+    assert code == 20 and "nothing was merged" in text and "exited 1" in text
+    job2, wt2 = _committed_task(fake, "t2", check="test -f b.txt && { test ! -f edit || echo more >> b.txt; }")
+    open(os.path.join(wt2, "edit"), "w").close()
+    git(wt2, "add", "edit")
+    git(wt2, "commit", "-q", "-m", "edit")
+    with pytest.raises(RepoState, match="the check changed the worktree"):
+        worktree.merge("t2")
+    assert git(repo, "rev-parse", "main").strip() == before and "more" in open(os.path.join(wt2, "b.txt")).read()
+
+
+def test_a_failing_merge_hook_is_aborted_and_recorded(repo, fake):
+    job, wt = _committed_task(fake)
+    hook = repo / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text("#!/bin/sh\necho hook says no >&2\nexit 1\n")
+    hook.chmod(0o755)
+    before = git(repo, "rev-parse", "main").strip()
+    with pytest.raises(RepoState, match="hook says no"):
+        worktree.merge("t1")
+    assert git(repo, "rev-parse", "main").strip() == before and worktree.changes(str(repo)) == []
+    assert subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=str(repo)).returncode != 0
+    failed = store.read_json(job.path("merge-failed.json"))
+    assert failed["aborted"] is True and "hook says no" in failed["output"] and not os.path.exists(job.path("merge.json"))
+
+
+def test_a_merge_waits_for_the_repository_lock(repo, fake):
+    job, wt = _committed_task(fake)
+    out = []
+    with worktree.lock(worktree.repo()):
+        th = threading.Thread(target=lambda: out.append(worktree.merge("t1")))
+        th.start()
+        time.sleep(1)
+        assert th.is_alive() and not os.path.exists(job.path("merge.json"))
+    th.join(30)
+    assert out[0][1] == 0
+
+
+def test_discard_drops_an_unmerged_task_only_without_uncommitted_changes(repo, fake):
+    set_turns, _ = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
+    job = task.start("t1", "Add b.txt.", model="m", check_cmd="true")
+    task.drive(job)
+    wt = worktree.worktree_path(worktree.repo(), "t1")
+    with pytest.raises(RepoState, match="uncommitted changes"):
+        worktree.discard("t1")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "work")
+    with pytest.raises(RepoState, match="not merged into main"):
+        worktree.cleanup("t1")
+    with store.flock(job.lock_path):
+        with pytest.raises(Running):
+            worktree.discard("t1")
+    assert worktree.discard("t1")[1] == 0
+    assert not os.path.exists(wt) and git(repo, "branch", "--list", "agy/t1") == ""
+    assert store.read_json(job.path("cleanup.json"))["action"] == "discard"
+
+
+def test_cli_merge_and_cleanup(repo, fake):
+    _committed_task(fake)
+    r = subprocess.run([sys.executable, AGYCALL, "task", "--merge", "t1"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.startswith("merged agy/t1 into main as "), r.stderr
+    r = subprocess.run([sys.executable, AGYCALL, "task", "--cleanup", "t1"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.startswith("removed the worktree ")
+    r = subprocess.run([sys.executable, AGYCALL, "task", "--merge", "nope"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "no task nope" in r.stderr

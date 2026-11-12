@@ -75,7 +75,11 @@ def _batch(a):
 
 
 def _task(a):
-    """agy-call task: start or rerun a coding task in its own worktree (spec 4.3); prints the hand-back."""
+    """agy-call task: start, rerun or continue a coding task in its own worktree and print the hand-back (spec 4.3,
+    4.7), or merge, clean up or discard one (4.8, 4.9)."""
+    for action in ("merge", "cleanup", "discard"):
+        if getattr(a, action):
+            return getattr(worktree, action)(getattr(a, action))
     if not a.job or not a.prompt_file:
         raise ValueError("task needs --job and --prompt-file")
     with open(a.prompt_file, encoding="utf-8") as fh:
@@ -146,6 +150,9 @@ def main(argv):
     t.add_argument("--new-version", action="store_true")
     t.add_argument("--continue", action="store_true", dest="cont")
     t.add_argument("--background", action="store_true")
+    actions = t.add_mutually_exclusive_group()
+    for action in ("merge", "cleanup", "discard"):
+        actions.add_argument("--" + action, metavar="JOB")
     w = sub.add_parser("worker")  # started by run --background; not for direct use
     w.add_argument("--store", required=True)
     w.add_argument("--job", required=True)
