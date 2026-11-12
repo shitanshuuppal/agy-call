@@ -125,16 +125,24 @@ def _held(job_id, cwd):
     job runs or another command holds it) and then the repository lock, both held until the block ends."""
     r = repo(cwd)
     job = st.Job(r.store, job_id)
-    t = (st.read_json(job.path("request.json"), {}) or {}).get("task")
-    if not t:
-        raise ValueError("no task %s in %s" % (job_id, r.store))
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(st.flock(job.lock_path, blocking=False))
         except st.Busy:
             raise Running("task %s is running or another agy-call command holds it" % job_id)
         stack.enter_context(lock(r))
+        t = (st.read_json(job.path("request.json"), {}) or {}).get("task")  # read under the locks: --new-version replaces it
+        if not t:
+            raise ValueError("no task %s in %s" % (job_id, r.store))
         yield r, job, t
+
+
+def _main_ready(top, base):
+    if current_branch(top) != base:
+        raise RepoState("the main checkout %s is not on %s; check out %s first" % (top, base, base))
+    dirty = changes(top)
+    if dirty:
+        raise RepoState("the main checkout %s has uncommitted or untracked files:\n%s" % (top, "\n".join(dirty)))
 
 
 def merge(job_id, cwd=None):
@@ -149,11 +157,7 @@ def merge(job_id, cwd=None):
         if dirty:
             raise RepoState("the task worktree %s has uncommitted changes; commit them on %s first:\n%s"
                             % (wt, br, "\n".join(dirty)))
-        if current_branch(top) != base:
-            raise RepoState("the main checkout %s is not on %s; check out %s first" % (top, base, base))
-        dirty = changes(top)
-        if dirty:
-            raise RepoState("the main checkout %s has uncommitted or untracked files:\n%s" % (top, "\n".join(dirty)))
+        _main_ready(top, base)
         task_commit, base_tip = _rev(top, "refs/heads/" + br), _rev(top, "refs/heads/" + base)
         if _ok(top, "merge-base", "--is-ancestor", task_commit, base_tip):
             raise RepoState("%s has no commit that %s does not have; commit the task's work on %s first" % (br, base, br))
@@ -172,6 +176,9 @@ def merge(job_id, cwd=None):
         if changes(wt) or _rev(wt, "HEAD") != task_commit or _rev(top, "refs/heads/" + br) != task_commit:
             raise RepoState("the check changed the worktree or the branch %s, so nothing was merged; its changes stay in "
                             "%s" % (br, wt))
+        _main_ready(top, base)  # the check command ran arbitrary code: look at the main checkout again
+        if _rev(top, "refs/heads/" + base) != base_tip:
+            raise RepoState("%s moved while the check ran, so nothing was merged" % base)
         p = subprocess.run(["git", "merge", "--no-ff", "--no-edit", "-m", "Merge agy task %s" % job_id, br], cwd=top,
                            capture_output=True, text=True, env=dict(os.environ, GIT_EDITOR="true"))
         if p.returncode:
@@ -202,6 +209,9 @@ def _remove(r, job, t, action):
     Records the removal in cleanup.json; the job record stays."""
     wt, br = t["worktree"], t["branch"]
     tip = _rev(r.top, "refs/heads/" + br)
+    if os.path.isdir(wt) and (current_branch(wt) != br or _rev(wt, "HEAD") != tip):
+        raise RepoState("the worktree %s is not on the tip of %s (it is on %s); merge or move its extra commits first"
+                        % (wt, br, current_branch(wt) or _rev(wt, "HEAD")))
     if os.path.isdir(wt):
         git(r.top, "worktree", "remove", wt)
     else:

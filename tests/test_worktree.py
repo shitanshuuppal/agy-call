@@ -92,7 +92,7 @@ def _committed_task(fake, job_id="t1", check="test -f b.txt", files=None):
     set_turns, _ = fake
     set_turns(reply("Created b.txt.", write=files or {"b.txt": "b\n"}))
     job = task.start(job_id, "Add b.txt.", model="m", check_cmd=check)
-    task.drive(job)
+    bounded(lambda: task.drive(job))
     wt = worktree.worktree_path(worktree.repo(), job_id)
     git(wt, "add", "-A")
     git(wt, "commit", "-q", "-m", "agy task %s" % job_id)
@@ -182,19 +182,19 @@ def test_a_merge_waits_for_the_repository_lock(repo, fake):
     job, wt = _committed_task(fake)
     out = []
     with worktree.lock(worktree.repo()):
-        th = threading.Thread(target=lambda: out.append(worktree.merge("t1")))
+        th = threading.Thread(target=lambda: out.append(worktree.merge("t1")), daemon=True)
         th.start()
         time.sleep(1)
         assert th.is_alive() and not os.path.exists(job.path("merge.json"))
     th.join(30)
-    assert out[0][1] == 0
+    assert not th.is_alive() and out[0][1] == 0
 
 
 def test_discard_drops_an_unmerged_task_only_without_uncommitted_changes(repo, fake):
     set_turns, _ = fake
     set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}))
     job = task.start("t1", "Add b.txt.", model="m", check_cmd="true")
-    task.drive(job)
+    bounded(lambda: task.drive(job))
     wt = worktree.worktree_path(worktree.repo(), "t1")
     with pytest.raises(RepoState, match="uncommitted changes"):
         worktree.discard("t1")
@@ -212,9 +212,51 @@ def test_discard_drops_an_unmerged_task_only_without_uncommitted_changes(repo, f
 
 def test_cli_merge_and_cleanup(repo, fake):
     _committed_task(fake)
-    r = subprocess.run([sys.executable, AGYCALL, "task", "--merge", "t1"], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([sys.executable, AGYCALL, "task", "--merge", "t1"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0 and r.stdout.startswith("merged agy/t1 into main as "), r.stderr
-    r = subprocess.run([sys.executable, AGYCALL, "task", "--cleanup", "t1"], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([sys.executable, AGYCALL, "task", "--cleanup", "t1"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0 and r.stdout.startswith("removed the worktree ")
-    r = subprocess.run([sys.executable, AGYCALL, "task", "--merge", "nope"], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([sys.executable, AGYCALL, "task", "--merge", "nope"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 2 and "no task nope" in r.stderr
+
+
+def test_cleanup_and_discard_refuse_a_worktree_that_moved_off_the_task_branch(repo, fake):
+    for name in ("cleanup", "discard"):
+        job, wt = _committed_task(fake, "m" + name, check="test -f f%s.txt" % name, files={"f%s.txt" % name: "f\n"})
+        assert worktree.merge("m" + name)[1] == 0
+        git(wt, "checkout", "-q", "--detach")
+        (open(os.path.join(wt, "extra.txt"), "w")).write("x")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "extra work")
+        extra = git(wt, "rev-parse", "HEAD").strip()
+        with pytest.raises(RepoState, match="not on the tip of agy/m%s" % name):
+            getattr(worktree, name)("m" + name)
+        assert os.path.isdir(wt) and git(wt, "rev-parse", "HEAD").strip() == extra
+        assert git(repo, "branch", "--list", "agy/m" + name).strip() != ""
+
+
+def test_merge_refuses_when_the_check_switches_the_main_checkout(repo, fake):
+    job, wt = _committed_task(fake, check="test -f b.txt && { test ! -f go || git -C %s checkout -q -b elsewhere; }" % repo)
+    open(os.path.join(wt, "go"), "w").close()
+    git(wt, "add", "go")
+    git(wt, "commit", "-q", "-m", "go")
+    before = git(repo, "rev-parse", "main").strip()
+    with pytest.raises(RepoState, match="main checkout"):
+        worktree.merge("t1")
+    assert git(repo, "rev-parse", "main").strip() == before and git(repo, "rev-parse", "elsewhere").strip() == before
+    assert not os.path.exists(job.path("merge.json"))
+
+
+def test_merge_reads_the_task_record_after_taking_the_locks(repo, fake, monkeypatch):
+    job, wt = _committed_task(fake)
+    real = worktree.lock
+
+    def replaced(r):  # a --new-version replaces the record between the first read and the lock
+        req = store.read_json(job.path("request.json"))
+        req["task"]["check"] = "false"
+        store.write_atomic(job.path("request.json"), req)
+        return real(r)
+
+    monkeypatch.setattr(worktree, "lock", replaced)
+    text, code = worktree.merge("t1")
+    assert code == 20 and not os.path.exists(job.path("merge.json"))
