@@ -1,7 +1,7 @@
 # agy plugin: Codex-style delegation and review for Gemini
 
-Status: built in steps 1 to 5 on 2026-11-12 (each step planned, implemented test-first and reviewed by Codex; the plans in docs/superpowers/plans record every ruling); released as 0.2.0.
-Deviations decided during the build: snapshot worktrees live at `<worktrees>/<repo id>/.snap/<job>` (a job id cannot start with a dot, so no task worktree can share the path) and are created with git hooks disabled; the prompt limit is 131071 bytes on Linux and 512 KiB on macOS; the task and review grant, including the deny mirror, is rebuilt before every launch; a schema keyword the validator does not enforce exits 2.
+Status: built in steps 1 to 5 on 2026-11-12 (each step planned, implemented test-first and reviewed by Codex; the plans in docs/superpowers/plans record each step's original design, and the rulings made while building it are summarised in the deviations below); released as 0.2.0.
+Deviations decided during the build: snapshot worktrees live at `<worktrees>/<repo id>/.snap/<job>` (a job id cannot start with a dot, so no task worktree can share the path) and are created with git hooks disabled; the prompt limit is 131071 bytes on Linux and 512 KiB on macOS; the task and review grant, including the deny mirror and `"allowNonWorkspaceAccess": false`, is rebuilt before every launch; a schema keyword the validator does not enforce exits 2.
 
 ## 1. Purpose
 
@@ -461,7 +461,10 @@ Results measured on agy 1.5.6 with Gemini 3.8 Flash on 2026-11-12, before step 3
 - `--sandbox` does not stop a granted command from writing outside the workspace: `touch` on a path outside the working directory succeeded with and without it. The guarantee in 4.1 stays limited to agy's own file-writing tool.
 - Gemini in headless agy did not call a URL tool even with `read_url(github.com)` granted, so URL grants could not be measured and play no part in task grants.
 The release check after step 3 repeats the first two measurements with the deny mirror in place.
-Release check result (2026-11-12, agy 1.5.6, Gemini 3.8 Flash Low, through the installed agy-call): a real task wrote its file inside its worktree, replied `NEED: gcloud run --help` for a command not on its list and ended blocked (exit 28) with the hand-back; agy's own log shows the run initialised with exactly the job's 12 allow rules and a deny list mirroring all 10 shared grants from `~/.gemini/config/config.json`, including the `command(gcloud run)` grant from the measurement above. With the resume results above, both release conditions hold.
+Release check result (2026-11-12, agy 1.5.6, Gemini 3.8 Flash Low, through the installed agy-call): a real task wrote its file inside its worktree, replied `NEED: gcloud run --help` for a command not on its list and ended blocked (exit 28) with the hand-back; agy's own log shows the run initialised with exactly the job's 12 allow rules and a deny list mirroring all 10 shared grants from `~/.gemini/config/config.json`, including the `command(gcloud run)` grant from the measurement above. That run shows the grant reaching agy, not its enforcement, because Gemini followed the `NEED:` instruction instead of trying the command.
+Direct enforcement probes the same day used that exact generated grant with prompts that tried the forbidden actions: `gcloud run --help` was refused with "Matches user-configured deny rule".
+A write outside the worktree with agy's own file-writing tool succeeded, because the user's global `allowNonWorkspaceAccess: true` still applied (`--settings` replaces only `permissions`); so the first release condition failed in 0.2.0.
+With `"allowNonWorkspaceAccess": false` added to the grant the same write was refused (`denied_actions` write_file) and a write inside the granted folder still succeeded; every task and review grant carries that key from 0.2.1 on, and both release conditions hold with it.
 
 ## 11. Migration
 
