@@ -115,3 +115,15 @@ def test_worker_records_a_setup_failure_instead_of_leaving_the_job_queued(tmp_pa
     s = job.status()
     assert s["state"] == "fatal" and s["code"] == 2 and "schema.json" in s["findings"][0]
     assert control.result(job.store, "j1")[1] == 2 and launches() == []
+
+
+def test_background_run_resolves_a_relative_agy_path_for_the_worker(tmp_path, fake):
+    set_turns, launches = fake
+    set_turns(reply("the answer"))
+    env = dict(os.environ, AGYCALL_AGY="./agy")  # the fake is tmp_path/agy; the worker starts in the job's folder
+    r = run_cli("run", "--background", "--job", "j1", "--store", "s", "--model", "m", "--prompt", "q",
+                cwd=str(tmp_path), env=env)
+    assert r.returncode == 0
+    job = store.Job(str(tmp_path / "s"), "j1")
+    wait_for(lambda: job.status().get("state") in ("done", "fatal"))
+    assert job.status()["state"] == "done" and len(launches()) == 1

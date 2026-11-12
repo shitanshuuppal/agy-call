@@ -2,6 +2,7 @@
 import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -207,6 +208,9 @@ def start(job_id, prompt, **kw):
     """`run --background`: record the run as queued and start a detached worker for it (spec 7.1); returns the job id."""
     job = runner.enqueue(job_id, prompt, **kw)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (ROOT, os.environ.get("PYTHONPATH")) if p))
+    exe = os.environ.get("AGYCALL_AGY") or shutil.which("agy")  # the worker starts in the job folder: make it absolute here
+    if exe:
+        env["AGYCALL_AGY"] = os.path.abspath(exe)
     with open(job.path("worker.log"), "ab") as log:
         subprocess.Popen([sys.executable, "-m", "agycall.cli", "worker", "--store", job.store, "--job", job.id],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=job.dir, env=env,
