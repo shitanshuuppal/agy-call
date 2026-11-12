@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +15,14 @@ def script(tmp_path, body):
     p.write_text("#!%s\nimport os, signal, subprocess, sys, time\n%s\n" % (sys.executable, body))
     p.chmod(0o755)
     return str(p)
+
+
+def kill_group(pids):
+    for pid in pids:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def attempt(tmp_path):
@@ -111,10 +120,34 @@ def test_cancel_stops_the_whole_process_group(tmp_path, monkeypatch):
     out = att / "agy.out"
     pids = []
     t0 = time.monotonic()
-    r = agy.run(str(att), [exe, "-p", "x"], cwd=str(tmp_path), deadline=60, on_start=lambda pid, when: pids.append(pid),
-                should_stop=lambda: "cancel" if out.exists() and out.read_bytes().startswith(b"started") else None)
-    assert r.stopped == "cancel" and r.exit is None and time.monotonic() - t0 < 10
-    assert r.out == b"started\n" and not agy.alive(pids[0])
+    try:
+        r = agy.run(str(att), [exe, "-p", "x"], cwd=str(tmp_path), deadline=30, on_start=lambda pid, when: pids.append(pid),
+                    should_stop=lambda: "cancel" if out.exists() and out.read_bytes().startswith(b"started") else None)
+        assert r.stopped == "cancel" and r.exit is None and time.monotonic() - t0 < 10
+        assert r.out == b"started\n" and not agy.alive(pids[0])
+    finally:
+        kill_group(pids)
+
+
+def test_failing_stop_check_stops_the_group_and_propagates(tmp_path, monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    monkeypatch.setattr(agy, "KILL_AFTER", 1)
+    exe = script(tmp_path, "subprocess.Popen(['sleep', '30']); time.sleep(30)")
+    pids, polls = [], []
+
+    def should_stop():
+        polls.append(1)
+        if len(polls) == 2:
+            raise OSError("cancel flag unreadable")
+
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(OSError, match="cancel flag unreadable"):
+            agy.run(str(attempt(tmp_path)), [exe, "-p", "x"], cwd=str(tmp_path), deadline=30,
+                    on_start=lambda pid, when: pids.append(pid), should_stop=should_stop)
+        assert time.monotonic() - t0 < 10 and not agy.alive(pids[0])
+    finally:
+        kill_group(pids)
 
 
 def test_no_stop_request_lets_agy_finish(tmp_path, monkeypatch):
@@ -130,7 +163,7 @@ def test_owns_needs_the_same_pid_and_start_time():
     assert not agy.owns(dict(me, pstart="Thu Jan  1 00:00:00 1970"))
     assert not agy.owns({"pid": os.getpid(), "pstart": None}) and not agy.owns(None) and not agy.owns({})
     dead = subprocess.Popen(["true"])
-    dead.wait()
+    dead.wait(timeout=30)
     assert not agy.owns({"pid": dead.pid, "pstart": me["pstart"]})
 
 

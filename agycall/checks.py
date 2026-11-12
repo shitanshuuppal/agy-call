@@ -109,7 +109,13 @@ def run_cmd(cmd, text, timeout, cwd=None, fds=(), on_start=None, should_stop=Non
                 p.wait(timeout=agy.POLL)
                 break
             except subprocess.TimeoutExpired:
-                if should_stop and should_stop() == "cancel":
+                try:
+                    asked = should_stop() if should_stop else None
+                except BaseException:  # a failing cancel check must not leave the group running
+                    agy.stop_group(p.pid, p.poll)
+                    p.wait()
+                    raise
+                if asked == "cancel":
                     agy.stop_group(p.pid, p.poll)
                     p.wait()
                     raise Cancelled("the check command was stopped by a cancel request")

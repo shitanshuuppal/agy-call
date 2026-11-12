@@ -127,7 +127,13 @@ def run(att, cmd, *, cwd, deadline, fds=(), on_start=None, should_stop=None):
             rc, stopped = p.wait(timeout=POLL), None
             break
         except subprocess.TimeoutExpired:
-            if should_stop and should_stop() == "cancel":
+            try:
+                asked = should_stop() if should_stop else None
+            except BaseException:  # a failing cancel check must not leave the group running
+                stop_group(p.pid, p.poll)
+                p.wait()
+                raise
+            if asked == "cancel":
                 stopped = "cancel"
             elif time.monotonic() >= end:
                 stopped = "deadline"

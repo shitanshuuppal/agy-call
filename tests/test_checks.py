@@ -1,10 +1,20 @@
 import json
+import os
+import signal
 import time
 
 import pytest
 
 from agycall import agy, checks
 from agycall.errors import Cancelled, CheckError
+
+
+def kill_group(pids):
+    for pid in pids:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def test_extract_json_whole_fenced_and_embedded():
@@ -147,10 +157,33 @@ def test_check_cmd_cancel_stops_its_process_group(monkeypatch):
     monkeypatch.setattr(agy, "POLL", 0.1)
     seen = []
     t0 = time.monotonic()
-    with pytest.raises(Cancelled) as e:
-        checks.run_cmd("sleep 30 & sleep 30", "text", 60, on_start=lambda pid, when: seen.append(pid),
-                       should_stop=lambda: "cancel" if seen else None)
-    assert e.value.code == 27 and time.monotonic() - t0 < 10 and not agy.alive(seen[0])
+    try:
+        with pytest.raises(Cancelled) as e:
+            checks.run_cmd("sleep 30 & sleep 30", "text", 30, on_start=lambda pid, when: seen.append(pid),
+                           should_stop=lambda: "cancel" if seen else None)
+        assert e.value.code == 27 and time.monotonic() - t0 < 10 and not agy.alive(seen[0])
+    finally:
+        kill_group(seen)
+
+
+def test_check_cmd_failing_stop_check_stops_the_group_and_propagates(monkeypatch):
+    monkeypatch.setattr(agy, "POLL", 0.1)
+    monkeypatch.setattr(agy, "KILL_AFTER", 1)
+    seen, polls = [], []
+
+    def should_stop():
+        polls.append(1)
+        if len(polls) == 2:
+            raise OSError("cancel flag unreadable")
+
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(OSError, match="cancel flag unreadable"):
+            checks.run_cmd("sleep 30 & sleep 30", "text", 30, on_start=lambda pid, when: seen.append(pid),
+                           should_stop=should_stop)
+        assert time.monotonic() - t0 < 10 and not agy.alive(seen[0])
+    finally:
+        kill_group(seen)
 
 
 def test_make_check_passes_run_options_and_does_not_wrap_a_cancel(tmp_path, monkeypatch):
