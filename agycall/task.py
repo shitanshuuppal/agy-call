@@ -209,9 +209,9 @@ def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, b
         if not os.path.isdir(t["worktree"]):
             raise RepoState("the worktree %s of task %s is missing; start the task again with --new-version"
                             % (t["worktree"], job_id))
-        if job.status().get("state") == "queued":  # its worker has not started: it would run only the newest segment
-            raise Running("a continuation is already queued for task %s; wait for its worker to start (or run the "
-                          "task again to recover a worker that never did)" % job_id)
+        if job.status().get("state") == "queued":  # reserved, and drive has not taken it: it would run only the newest
+            raise Running("a continuation is already queued for task %s; wait for it to start (or run the task "
+                          "again to recover a controller that never did)" % job_id)
         att = runner.pending(job)
         if att:
             runner._interrupt(job, att)
@@ -236,9 +236,9 @@ def continue_(job_id, text, *, allow=(), max_turns=3, deadline="2h", cwd=None, b
             for dest, src in moved:
                 os.replace(dest, src)
             raise
-        job.set_status(findings=[], need=[], denied=[])
+        job.set_status(findings=[], need=[], denied=[], state="queued")  # reserved until drive takes the segment
         if background:
-            _queue(job)
+            st.write_atomic(job.path("background.json"), {"kind": "task"})
     return job
 
 
@@ -253,6 +253,8 @@ def drive(job):
         fd = runner._lock(job, stack)
         n = segments(job)[-1]  # chosen under the lock, so a segment added meanwhile is the one that runs
         seg = st.read_json(_segment_path(job, n))
+        if job.status().get("state") == "queued":  # the reserved segment is taken: another --continue may follow
+            job.set_status(state="running")
         c = runner._prepare(job.id, seg["prompt"], store=job.store, model=t["model"], timeout=t["timeout"],
                             cwd=t["worktree"], check_cmd=t["check"], check_timeout=t["checkTimeout"],
                             settings=seg["grant"], effort=t["effort"], policy="task", segment=n,

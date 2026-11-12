@@ -381,6 +381,7 @@ def test_continue_after_the_controller_died_settles_the_old_turn_first(repo, fak
     job = _start()
     task.drive(job)
     task.continue_("t1", "Add c.txt.")
+    job.set_status(state="running")  # its drive took the segment, then the controller died
     att = job.new_attempt()  # segment 2's first turn: its controller died after agy wrote a complete reply
     dead = subprocess.Popen(["true"])
     bounded(lambda: dead.wait(timeout=30), [dead.pid])
@@ -502,3 +503,19 @@ def test_a_shared_config_that_became_malformed_stops_the_next_launch(repo, fake)
     with pytest.raises(ValueError, match="shared grants"):
         task.drive(job)
     assert len(launches()) == 1 and job.status()["state"] == "setup-error"
+
+
+def test_a_foreground_continuation_is_reserved_until_its_drive_takes_it(repo, fake):
+    set_turns, launches = fake
+    set_turns(reply("Created b.txt.", write={"b.txt": "b\n"}), reply("Created c.txt.", write={"c.txt": "c\n"}))
+    job = _start()
+    task.drive(job)
+    job = task.continue_("t1", "Add c.txt.")  # reserved: its drive has not started
+    assert job.status()["state"] == "queued"
+    with pytest.raises(Running, match="already queued") as e:
+        task.continue_("t1", "Another.")
+    assert e.value.code == 25 and task.segments(job) == [1, 2]
+    assert control.result(job.store, "t1")[1] == 25  # the old answer is not reported as done
+    assert task.drive(job).answer == "Created c.txt."
+    assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add c.txt.")
+    assert job.status()["state"] == "done"
