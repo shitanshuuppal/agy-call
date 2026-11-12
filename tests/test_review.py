@@ -42,9 +42,9 @@ def test_a_snapshot_holds_staged_unstaged_and_untracked_files_and_leaves_the_che
     assert _refs(repo) == ["refs/agy-call/" + job.id]
     assert git(repo, "rev-parse", "refs/agy-call/" + job.id).strip() == rv["snapshot"]
     snap = rv["worktree"]
-    assert snap == worktree.worktree_path(worktree.repo(), job.id + "-snap")
+    assert snap == os.path.join(os.path.dirname(worktree.worktree_path(worktree.repo(), "x")), ".snap", job.id)
     assert git(snap, "rev-parse", "HEAD").strip() == rv["snapshot"] and open(os.path.join(snap, "c.txt")).read() == "new\n"
-    assert subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=snap).returncode == 1  # detached
+    assert subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=snap, timeout=30).returncode == 1  # detached
     assert open(rv["schema"]).read() == review.SCHEMA_TEXT
     req = store.read_json(job.path("request.json"))
     assert req["kind"] == "review" and req["cwd"] == snap
@@ -336,3 +336,38 @@ def test_a_rerun_after_a_quota_stop_continues_the_conversation(repo, fake):
     quota.clear("m", quota.generation("m"))
     assert review.drive(review.start(model="m")).text and len(launches()) == 2
     assert job.status()["state"] == "done"
+
+
+def test_a_task_named_like_the_old_snapshot_folder_does_not_share_it(repo):
+    r = worktree.repo()
+    worktree.create(r, "r1-snap")
+    (repo / "a.txt").write_text("changed\n")
+    job = review.start(model="m", job_id="r1")
+    assert _rv(job)["worktree"] != worktree.worktree_path(r, "r1-snap")
+    assert git(_rv(job)["worktree"], "rev-parse", "HEAD").strip() == _rv(job)["snapshot"]
+    assert os.path.isdir(worktree.worktree_path(r, "r1-snap"))
+
+
+def test_an_edited_or_foreign_snapshot_folder_is_refused_and_left_alone(repo):
+    (repo / "a.txt").write_text("changed\n")
+    job = review.start(model="m", job_id="r1")
+    snap = _rv(job)["worktree"]
+    with open(os.path.join(snap, "a.txt"), "w") as f:
+        f.write("edited\n")
+    with pytest.raises(RepoState):
+        review.start(model="m", job_id="r1")
+    assert open(os.path.join(snap, "a.txt")).read() == "edited\n"
+    (repo / "a.txt").write_text("other\n")
+    foreign = os.path.join(os.path.dirname(snap), "r2")
+    os.makedirs(foreign)
+    with pytest.raises(RepoState):
+        review.start(model="m", job_id="r2")
+    assert os.listdir(foreign) == [] and not os.path.exists(worktree.repo().store + "/r2")
+
+
+def test_scope_detection_leaves_the_index_bytes_alone(repo):
+    os.utime(repo / "a.txt", (1, 1))  # a stale stat entry: only the mtime differs
+    (repo / ".gitignore").write_text("build/\nmore\n")
+    index = (repo / ".git" / "index").read_bytes()
+    review.start(model="m")
+    assert (repo / ".git" / "index").read_bytes() == index

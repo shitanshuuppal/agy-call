@@ -84,7 +84,9 @@ def target(top, scope="auto", base=None):
     """Spec 8.2: the scope used, the base commit, the tree under review, the snapshot commit for branch scope, and the
     changed files; RepoState (26) when there is nothing to review."""
     if scope == "auto":
-        scope = "working-tree" if worktree.changes(top) else "branch"
+        # GIT_OPTIONAL_LOCKS=0: status must not refresh the stat cache in the user's own index
+        scope = "working-tree" if worktree.git(top, "status", "--porcelain",
+                                               env=dict(os.environ, GIT_OPTIONAL_LOCKS="0")).strip() else "branch"
     head = None
     if scope == "working-tree":
         base_commit = worktree.git(top, "rev-parse", "--verify", "HEAD").strip()
@@ -125,12 +127,40 @@ def prompt(rv):
                          commands="\n".join("- " + c for c in task.READ_ONLY), extra=extra, schema=SCHEMA_TEXT)
 
 
+def snapshot_path(r, job_id):
+    """The snapshot worktree of a review: in .snap, which no job id can equal, so no task worktree shares it."""
+    return os.path.join(os.path.dirname(worktree.worktree_path(r, job_id)), ".snap", job_id)
+
+
+def _check_existing(top, rv):
+    """An existing snapshot folder is reused only when it is a clean, detached worktree of this repository at the
+    recorded snapshot commit; anything else is refused (RepoState, exit 26) and left as it is."""
+    wt = rv["worktree"]
+    if not os.path.lexists(wt):
+        return False
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    try:
+        mine = os.path.realpath(os.path.join(top, worktree.git(top, "rev-parse", "--git-common-dir", env=env).strip()))
+        theirs = os.path.realpath(os.path.join(wt, worktree.git(wt, "rev-parse", "--git-common-dir", env=env).strip()))
+        ok = (os.path.realpath(worktree.git(wt, "rev-parse", "--show-toplevel", env=env).strip()) == os.path.realpath(wt)
+              and mine == theirs and not worktree.current_branch(wt)
+              and worktree.git(wt, "rev-parse", "HEAD", env=env).strip() == rv["snapshot"]
+              and not worktree.git(wt, "status", "--porcelain", env=env).strip())
+    except RepoState:
+        ok = False
+    if not ok:
+        raise RepoState("%s exists but is not the clean snapshot worktree of review at %s; move it away or pass "
+                        "another --job" % (wt, rv["snapshot"]))
+    return True
+
+
 def _snapshot(top, rv):
     """Make sure the snapshot ref and the detached snapshot worktree exist (spec 8.3), on the first run and on a rerun
     after --cleanup removed them."""
+    present = _check_existing(top, rv)
     if not worktree._ok(top, "show-ref", "--verify", "--quiet", rv["ref"]):
         worktree.git(top, "update-ref", rv["ref"], rv["snapshot"])
-    if not os.path.isdir(rv["worktree"]):
+    if not present:
         worktree.private(os.path.dirname(rv["worktree"]))
         worktree.git(top, "worktree", "add", "-q", "--detach", rv["worktree"], rv["snapshot"])
 
@@ -168,10 +198,12 @@ def start(*, model, effort=None, scope="auto", base=None, adversarial=False, foc
                                           "agy-call review snapshot " + job.id, t.tree,
                                           env=dict(os.environ, **SNAP_ENV)).strip()
             rv = {"repo": r.id, "checkout": r.top, "scope": t.scope, "base": t.base, "tree": t.tree, "snapshot": snap,
-                  "ref": REF + job.id, "worktree": worktree.worktree_path(r, job.id + "-snap"), "files": t.files,
+                  "ref": REF + job.id, "worktree": snapshot_path(r, job.id), "files": t.files,
                   "adversarial": bool(adversarial), "focus": focus or "", "model": model, "effort": effort,
                   "timeout": timeout, "maxTurns": max_turns, "grant": job.path("grant-1.json"),
                   "schema": job.path("schema.json")}
+            if not os.path.exists(job.path("answer.txt")):
+                _check_existing(r.top, rv)  # refuse a conflicting folder before the first write
             text = prompt(rv)
             if len(text.encode("utf-8")) > agy.MAX_PROMPT:
                 raise ValueError("the review prompt is %d bytes, over this system's single-argument limit of %d bytes; "
