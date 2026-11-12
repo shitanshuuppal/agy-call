@@ -68,8 +68,9 @@ def commands(allow):
 
 def grant(worktree, allow):
     """The --settings content of a task (spec 4.2): writes inside the worktree and the allowed commands; every shared
-    grant that is not exactly one of these goes in deny, which agy checks before allow."""
-    own = ["write_file(%s)" % worktree] + ["command(%s)" % c for c in commands(allow)]
+    grant that is not exactly one of these goes in deny, which agy checks before allow. A review passes no worktree and
+    no --allow entries, so its grant is the read-only commands alone."""
+    own = (["write_file(%s)" % worktree] if worktree else []) + ["command(%s)" % c for c in commands(allow)]
     return {"permissions": {"allow": own, "deny": list(dict.fromkeys(g for g in shared_grants() if g not in own))}}
 
 

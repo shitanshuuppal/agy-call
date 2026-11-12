@@ -35,6 +35,19 @@ NEED = re.compile(r"^[ \t]*NEED:.*$", re.MULTILINE)
 TASK_STOPS = ("failed", "blocked", "interrupted")  # a task segment that ended this way sends nothing more on a rerun
 INTERRUPTED = ("the process running this task stopped before agy's output was complete, and nothing was resent; "
                "agy-call result shows the worktree's changes; continue with task --continue")
+FIX_REVIEW = ("Your review could not be used because its format is wrong: {findings}. Reply again with the corrected "
+              "JSON object only, keeping the findings you made.")
+SUMMARY_REVIEW = ("Your last turn ended without a reply. Do not run anything more; reply only with the JSON object of "
+                  "your review.")
+INTERRUPTED_REVIEW = ("the process running this review stopped before agy's output was complete, and nothing was "
+                      "resent; review again under another --job")
+POLICIES = {  # per policy: the fix and summary-only messages, the state of a setup failure, and for the task and review
+    # columns of spec 5.2 what a stop calls the job, what it suggests, and the finding of an interrupted turn
+    "run": {"fix": FIX, "summary": SUMMARY_ONLY, "fatal": "fatal"},
+    "task": {"fix": FIX_TASK, "summary": SUMMARY_ONLY, "fatal": "setup-error", "what": "a coding task",
+             "again": "continue with task --continue", "interrupted": INTERRUPTED},
+    "review": {"fix": FIX_REVIEW, "summary": SUMMARY_REVIEW, "fatal": "setup-error", "what": "a review",
+               "again": "review again under another --job", "interrupted": INTERRUPTED_REVIEW}}
 
 
 @dataclasses.dataclass
@@ -127,7 +140,7 @@ def _result(job, want_json):
                   conversation=job.status().get("conversation"), attempts=len(job.launched()), usage=_usage(job), dir=job.dir)
 
 
-def _next(prompt, last, launch, fix=FIX):
+def _next(prompt, last, launch, fix=FIX, summary=SUMMARY_ONLY):
     if last is None:
         return prompt, "first"
     outcome = last.get("outcome")
@@ -140,7 +153,7 @@ def _next(prompt, last, launch, fix=FIX):
     if outcome == "need":
         return NEED_ONLY, "need"
     if outcome == "summary":
-        return SUMMARY_ONLY, "summary"
+        return summary, "summary"
     msg = fix.format(findings="; ".join(last.get("findings") or ["the reply was not usable"]))
     if last.get("lostContext"):
         msg += LOST.format(prompt=prompt)
@@ -241,7 +254,7 @@ def _interrupt(job, att):
 
 def _launch(c, att, message, kind, generation):
     cmd = agy.argv(agy.path(), message, model=c.model, timeout=c.timeout, mode=c.mode, dirs=c.dirs, conversation=c.conv,
-                   settings=c.settings, effort=c.effort)
+                   settings=c.settings, effort=c.effort, json_schema=c.json_schema)
     launch = {"pid": None, "pgid": None, "kind": kind, "message": message, "conversation": c.conv,
               "generation": generation, "started": _now(), "argv": agy.redact(cmd)}
     deadline = agy.seconds(c.timeout) + agy.GRACE
@@ -316,7 +329,7 @@ def _settle(c, att, oc, recovered=False):
     if got and not c.conv:
         _hold(c, got)
     name = oc.name
-    if c.policy == "task" and name not in ("quota", "auth", "model", "malformed"):  # the task column of spec 5.2
+    if c.policy != "run" and name not in ("quota", "auth", "model", "malformed"):  # spec 5.2's task and review column
         need = [l.strip() for l in NEED.findall(oc.response)]
         asked = launch.get("message") == NEED_ONLY  # the message survives a retry, the kind does not
         if name == "denied" and oc.denied == ["command"] and c.conv and not need and not asked:
@@ -330,12 +343,12 @@ def _settle(c, att, oc, recovered=False):
             job.set_status(denied=kinds, need=need)
             raise Blocked(findings, job.dir)
         if name == "timeout":
-            give_up(["%s; the partial reply and the worktree are kept; continue with task --continue" % oc.reason])
+            give_up(["%s; the partial reply and the worktree are kept; %s" % (oc.reason, c.words["again"])])
         if name == "empty":
-            if c.conv and launch.get("message") != SUMMARY_ONLY:  # the message survives a retry, the kind does not
+            if c.conv and launch.get("message") != c.words["summary"]:  # the message survives a retry, the kind does not
                 finish(outcome="summary", findings=[oc.reason])  # one turn that asks only for the final summary
                 return None
-            give_up(["%s; a coding task is never resent blind; continue with task --continue" % oc.reason])
+            give_up(["%s; %s is never resent blind; %s" % (oc.reason, c.words["what"], c.words["again"])])
     if name == "reply" or (name in AGY_ERRORS and oc.response.strip()):
         if name != "reply":
             res["agyError"] = oc.reason
@@ -393,9 +406,10 @@ def _settle(c, att, oc, recovered=False):
 
 def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m", cwd=None, dirs=(), mode=None,
              conversation=None, expect=None, require=None, schema=None, check_cmd=None, check_timeout=120, check=None,
-             check_id=None, settings=None, effort=None, policy="run", segment=None, end=None):
-    """Check a request before anything is written, and return the job's working state. A task (policy "task") also
-    passes its grant file (settings), its effort, its segment number and the segment's end (an aware datetime)."""
+             check_id=None, settings=None, effort=None, policy="run", segment=None, end=None, json_schema=None):
+    """Check a request before anything is written, and return the job's working state. A task (policy "task") or a
+    review (policy "review") also passes its grant file (settings), its effort, its segment number and the segment's end
+    (an aware datetime); a review also passes the schema file that agy gets with --json-schema."""
     if not model:
         raise ValueError("model is required: pass the exact agy model name, e.g. gemini-4-argon-high")
     size = len(prompt.encode("utf-8"))
@@ -415,7 +429,8 @@ def _prepare(job_id, prompt, *, store=None, namespace=None, model=None, timeout=
     c.should_stop = lambda: "cancel" if _cancel_requested(job) else None
     c.policy, c.settings, c.effort, c.segment, c.end = policy, settings, effort, segment, end
     c.refresh = None  # a task sets a function that rewrites its grant file; the loop calls it before every launch
-    c.fix, c.fatal = (FIX_TASK, "setup-error") if policy == "task" else (FIX, "fatal")
+    c.words, c.json_schema = POLICIES[policy], json_schema
+    c.fix, c.fatal = c.words["fix"], c.words["fatal"]
     return c
 
 
@@ -468,9 +483,9 @@ def _drive(c, max_turns, ignore_quota, fresh):
     oc = _recovered(job, att, c.timeout) if att else None
     if att and oc is None:  # the saved output does not settle the attempt; run and batch restart the turn
         _interrupt(job, att)
-        if c.policy == "task":  # a task sends no automatic turn (spec 7.4)
-            job.set_status(state="failed", findings=[INTERRUPTED])
-            raise GaveUp([INTERRUPTED], c.conv, _usage(job), job.dir)
+        if c.policy != "run":  # a task or a review sends no automatic turn (spec 7.4)
+            job.set_status(state="failed", findings=[c.words["interrupted"]])
+            raise GaveUp([c.words["interrupted"]], c.conv, _usage(job), job.dir)
     conv = job.status().get("conversation") or c.seed
     for a in reversed(job.launched()):  # an id can sit in a result or launch file when the status write was lost
         if conv:
@@ -507,7 +522,7 @@ def _drive(c, max_turns, ignore_quota, fresh):
             raise GaveUp(findings, c.conv, _usage(job), job.dir)
         last_res.update(outcome="rejected", findings=verdict.findings, lostContext=verdict.lost_context)
         st.write_atomic(os.path.join(done[-1], "result.json"), last_res)
-    elif c.policy == "task" and last_res.get("outcome") in TASK_STOPS:
+    elif c.policy != "run" and last_res.get("outcome") in TASK_STOPS:
         findings = job.status().get("findings") or last_res.get("findings") or ["the task stopped"]
         if last_res["outcome"] == "blocked":
             job.set_status(state="blocked")
@@ -524,7 +539,8 @@ def _drive(c, max_turns, ignore_quota, fresh):
         atts = _atts(c)
         launches = [st.read_json(os.path.join(a, "launch.json"), {}) or {} for a in atts]
         results = [st.read_json(os.path.join(a, "result.json"), {}) or {} for a in atts]
-        message, kind = _next(prompt, results[-1] if results else None, launches[-1] if launches else None, c.fix)
+        message, kind = _next(prompt, results[-1] if results else None, launches[-1] if launches else None, c.fix,
+                              c.words["summary"])
         if kind == "retry-first" and not c.conv and results[-1].get("outcome") == "retry" and _agy_output(atts[-1]):
             kind = "retry-needs-conversation"  # agy may have opened a conversation we never saw
         if (kind not in FIRST_LIKE) and not c.conv:
@@ -542,7 +558,7 @@ def _drive(c, max_turns, ignore_quota, fresh):
             job.set_status(state="failed", findings=findings)
             raise GaveUp(findings, c.conv, _usage(job), job.dir)
         if c.end and dt.datetime.now(dt.timezone.utc) >= c.end:
-            findings = ["the segment's deadline passed at %s; continue with task --continue" % c.end.isoformat()]
+            findings = ["the segment's deadline passed at %s; %s" % (c.end.isoformat(), c.words["again"])]
             job.set_status(state="failed", findings=findings)
             raise GaveUp(findings, c.conv, _usage(job), job.dir)
         size = len(message.encode("utf-8"))

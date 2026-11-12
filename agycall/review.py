@@ -2,18 +2,20 @@
 prompt, the findings check, what `result` prints, and cleanup."""
 import collections
 import contextlib
+import datetime as dt
 import hashlib
 import json
 import os
 import shutil
 import tempfile
 
-from . import agy, runner, task, worktree
+from . import agy, checks, runner, task, worktree
 from . import store as st
 from .errors import Mismatch, RepoState
 
 SCOPES = ("auto", "working-tree", "branch")
 SEVERITIES = ("MUST-FIX", "SHOULD-FIX", "NIT")
+DEADLINE = "2h"  # spec 5.3: bounds one drive of a review across its turns
 SCHEMA = {"type": "object", "additionalProperties": False,
           "required": ["verdict", "summary", "files_reviewed", "findings"],
           "properties": {
@@ -181,3 +183,56 @@ def start(*, model, effort=None, scope="auto", base=None, adversarial=False, foc
         if not os.path.exists(job.path("answer.txt")):
             _snapshot(r.top, req["review"])
     return job
+
+
+def checker(files):
+    """Spec 8.4: the schema, then the file, line and verdict rules; a reply that breaks any of them gets a format-repair
+    turn. A reply that keeps them but leaves changed files out of files_reviewed is accepted with its verdict forced to
+    incomplete and the missing files listed, and no further turn is sent."""
+    def check(text, **run):
+        try:
+            value = checks.extract_json(text)
+        except ValueError as e:
+            return checks.Verdict(False, None, ["%s; reply with the JSON object only" % e], False)
+        findings = checks.validate(value, SCHEMA)
+        if not findings:
+            for i, f in enumerate(value["findings"]):
+                if f["file"] is not None and f["file"] not in files:
+                    findings.append("$.findings[%d].file %r is not one of the changed files; use null or one of: %s"
+                                    % (i, f["file"], ", ".join(files)))
+                if f["line_start"] is not None and f["line_end"] is not None and f["line_start"] > f["line_end"]:
+                    findings.append("$.findings[%d].line_start is greater than its line_end" % i)
+            if value["verdict"] == "approve" and any(f["severity"] != "NIT" for f in value["findings"]):
+                findings.append("$.verdict is approve but there is a MUST-FIX or SHOULD-FIX finding")
+        if findings:
+            return checks.Verdict(False, None, findings, False)
+        missing = [f for f in files if f not in value["files_reviewed"]]
+        if missing:
+            value = dict(value, verdict="incomplete", missing_files=missing)
+        return checks.Verdict(True, json.dumps(value, ensure_ascii=False, indent=1), [], False)
+    return check
+
+
+def drive(job):
+    """Run a review: in the foreground, on a rerun or in the background worker. A saved answer is returned without a
+    launch; otherwise the snapshot worktree must exist, and the runner writes the grant file again before every launch,
+    so its deny mirror follows the shared config as it is then. The deadline of spec 5.3 runs from the start of each
+    drive."""
+    req = st.read_json(job.path("request.json"), {}) or {}
+    rv = req.get("review")
+    if not rv:
+        raise ValueError("no review %s in %s" % (job.id, job.store))
+    end = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=agy.seconds(DEADLINE))
+    c = runner._prepare(job.id, req["prompt"], store=job.store, model=rv["model"], timeout=rv["timeout"],
+                        cwd=rv["worktree"], settings=rv["grant"], effort=rv["effort"], policy="review", segment=1,
+                        end=end, json_schema=rv["schema"])
+    c.checker, c.checked = checker(rv["files"]), True  # checked: a reply that came with an agy error may still pass
+    with contextlib.ExitStack() as stack:
+        c.stack = stack
+        c.fds.append(runner._lock(job, stack))
+        if not os.path.exists(job.path("answer.txt")) and not os.path.isdir(rv["worktree"]):
+            raise RepoState("the snapshot worktree %s of review %s is missing; run the same review command again "
+                            "to make it" % (rv["worktree"], job.id))
+        c.refresh = lambda: task.write_grant(rv["grant"], None, ())
+        runner._own(c, stack)
+        return runner._drive(c, rv["maxTurns"], False, False)
