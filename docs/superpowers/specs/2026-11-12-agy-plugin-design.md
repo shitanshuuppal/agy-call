@@ -1,6 +1,6 @@
 # agy plugin: Codex-style delegation and review for Gemini
 
-Status: built in steps 1 to 5 on 2026-11-12 (each step planned, implemented test-first and reviewed by Codex; the plans in docs/superpowers/plans record each step's original design, and the rulings made while building it are summarised in the deviations below); released as 0.2.0.
+Status: built in steps 1 to 5 on 2026-11-12 (each step planned, implemented test-first and reviewed by Codex; the plans in docs/superpowers/plans record each step's original design, and the rulings made while building it are summarised in the deviations below); released as 0.2.0, with the non-workspace write fix and four smaller fixes in 0.2.1; `docs/USAGE.md` is the practical guide.
 Deviations decided during the build: snapshot worktrees live at `<worktrees>/<repo id>/.snap/<job>` (a job id cannot start with a dot, so no task worktree can share the path) and are created with git hooks disabled; the prompt limit is 131071 bytes on Linux and 512 KiB on macOS; the task and review grant, including the deny mirror and `"allowNonWorkspaceAccess": false`, is rebuilt before every launch; a schema keyword the validator does not enforce exits 2.
 
 ## 1. Purpose

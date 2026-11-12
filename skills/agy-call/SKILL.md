@@ -22,6 +22,8 @@ Every agy call goes through `agy-call`, which saves every reply before it checks
 | an answer to a question, or to many items | none | `agy-call run`, `agy-call batch` (see run and batch) |
 
 When the user asks in plain words, do what the matching slash command does, as this skill describes it.
+A request that names Gemini or agy goes through this plugin; a request that names neither ("review this", "fix this") stays with Claude.
+`docs/USAGE.md` in this repository has a table of plain-language requests and the command each one maps to.
 The slash commands pass `--model gemini-4-argon-high`, and reviews also `--effort high`, unless the user names others.
 The `agy` subagent (`agy:agy`) runs exactly one agy-call command and returns its output unchanged; `/agy:task` starts tasks through it.
 Run every agy-call command from inside the repository it is about.
