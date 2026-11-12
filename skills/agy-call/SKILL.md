@@ -20,16 +20,17 @@ The hook matches the whole command text, so a command that only mentions `agy-de
 `agy-call run --job ID [options]` reads the prompt from `--prompt-file`, `--prompt` or stdin (in that order of preference; the first two are mutually exclusive).
 It prints the accepted answer on stdout, errors on stderr, and exits with the code in the table below.
 Run it with run_in_background for long jobs.
+A bad argument, job id or timeout, or a prompt larger than one command-line argument allows (512 KiB on macOS, 128 KiB on Linux), exits 2 before anything is launched.
 
 Options of `run` and `batch` (defaults in brackets):
 
 - `--store DIR`: the job store; put it inside the project, for example `<project>/agy-jobs` [`~/.agy-call/jobs/<namespace>`].
 - `--namespace NAME`: the folder under `~/.agy-call/jobs` when no `--store` is given [`default`].
 - `--model NAME`: required; the exact agy model name, for example `gemini-4-argon-high`; aliases and tiers are not accepted, because one name per model keeps the quota hold exact (the hold is kept per model string).
-- `--timeout T`: wall-clock limit per turn, passed to agy-delegate [`10m`].
+- `--timeout T`: limit per turn, passed to agy as `--print-timeout`; agy-call stops agy 60 seconds after it; a bare number means seconds [`10m`].
 - `--cwd DIR`: working directory of the call [the current directory].
-- `--dir DIR`: extra directory the agent may read; repeat the option for several [none].
-- `--mode MODE`: agy-delegate mode [agy-delegate's default].
+- `--dir DIR`: extra directory the agent may read, passed as `--add-dir`; repeat the option for several [none].
+- `--mode MODE`: agy's execution mode, `accept-edits`, `auto` or `plan` [agy's default].
 - `--expect json`: the reply must contain a JSON value (the last fenced `json` block that parses, the whole reply, or unfenced JSON surrounded by prose when it is the whole span from the first `{`/`[` to the last `}`/`]`); the accepted answer is that value re-printed as JSON.
 - `--require a,b`: comma-separated top-level keys the JSON object must have (implies `--expect json`).
 - `--schema FILE`: JSON Schema file (a subset) the JSON value must satisfy (implies `--expect json`).
@@ -67,7 +68,7 @@ from agycall import call, batch, AgyCallError, Quota
 `check` is a Python function that receives the parsed value (or the text) and returns a list of problems; it needs a stable `check_id` string, which is part of the job's identity, so change the `check_id` when the function's rules change.
 `batch(jobs, *, workers=4, **common)` takes a list of dicts as in the JSONL format and returns `{job_id: Result or exception}`; it never raises for a single job.
 
-Exceptions, all subclasses of `AgyCallError` with the CLI exit code in `.code`: `Running` (25), `Mismatch` (24), `Quota` (10, with `.key` and `.until`), `Fatal` (the delegate's code, with `.reason`), `GaveUp` (20, with `.findings`, `.conversation`, `.usage`, `.job_dir`), `CheckError` (21), `NoConversation` (23).
+Exceptions, all subclasses of `AgyCallError` with the CLI exit code in `.code`: `Running` (25), `Mismatch` (24), `Quota` (10, with `.key` and `.until`), `Fatal` (the failure's exit code, with `.reason`), `GaveUp` (20, with `.findings`, `.conversation`, `.usage`, `.job_dir`), `CheckError` (21), `NoConversation` (23).
 
 ## Job ids and stores
 
@@ -82,12 +83,12 @@ Keep the store inside the project (for example `<project>/agy-jobs`) so the repl
 |------|---------|
 | 0 | ok, answer printed |
 | 10 | quota: a hold exists for the model; the message prints the time it ends |
-| 11 | agy is not authenticated (agy-delegate code passed through) |
-| 13 | agy is missing (agy-delegate code passed through) |
-| 14 | model unavailable (agy-delegate code passed through) |
+| 11 | agy is not authenticated |
+| 13 | agy is missing: set `AGYCALL_AGY` or put agy on PATH |
+| 14 | model unavailable |
 | 20 | gave up: no usable reply within `--max-turns`, a tool call denied twice, or agy hit its output limit without a reply |
 | 21 | check error: the check itself failed to run; the reply is kept |
-| 22 | unknown agy-delegate exit |
+| 22 | agy's output was not a JSON envelope; the raw output is kept in `agy.out` |
 | 23 | no conversation id was captured, so a follow-up cannot be sent |
 | 24 | the job exists with a different request |
 | 25 | the job is running in another process |
@@ -96,16 +97,17 @@ An error that is not one of these (for example a bad argument) exits with 1 or 2
 
 ## Where replies are
 
-Under `<store>/<job>/attempts/NNN/` each launch keeps `agy-N.out` and `agy-N.err` (agy's raw streams, one pair per agy invocation, with `agy-N.args`), `delegate.out` and `delegate.err`, `launch.json` and `result.json`.
+Under `<store>/<job>/attempts/NNN/` each launch keeps `agy.out` (agy's JSON envelope, byte for byte), `agy.err` (agy's stderr), `agy.args` (the arguments, with the prompt replaced by its size and hash), `reply.txt` (the reply text, when there was one), `launch.json` (the prompt, process ids and start time) and `result.json` (agy's exit status, the envelope status, the classified outcome and what agy-call did).
+Attempts made before agy-call launched agy itself keep their older files (`delegate.out`, `delegate.err`, `agy-N.out`), and agy-call still reads them.
 The accepted answer is `<store>/<job>/answer.txt`; `request.json` and `status.json` sit beside it.
 Nothing is ever deleted: a replaced job moves under `.versions`, and failed attempts stay in place.
-When a call fails, read `agy-N.out` of the last attempt to see what agy actually said.
+When a call fails, read `reply.txt` and `agy.err` of the last attempt to see what agy actually said.
 
 ## What to do per exit
 
 - 10: wait until the printed time and rerun the same command, or ask the author; do not use `--ignore-quota` to get around it.
 - 20: read the findings; after an output-limit stop, send a new prompt that asks for a short reply, as a new job (see Coding tasks); otherwise rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`.
-- 21: a rerun checks the saved reply again before any new turn, but only when the request is unchanged: repair the checker's executable or environment, not the command string, schema file or `check_id`. After changing the check, the saved reply is in `attempts/NNN/delegate.out` and the raw output in `agy-N.out`; a rerun with `--new-version` starts a new paid job.
+- 21: a rerun checks the saved reply again before any new turn, but only when the request is unchanged: repair the checker's executable or environment, not the command string, schema file or `check_id`. After changing the check, the saved reply is in `attempts/NNN/reply.txt` and the raw output in `agy.out`; a rerun with `--new-version` starts a new paid job.
 - 23: rerun with `--fresh` if starting a new conversation is acceptable; otherwise use the replies saved under `attempts/`.
 - 24: the request changed; use a new job id, or `--new-version` to replace the old job.
 - 25: another process holds the job; wait for it and rerun, which then returns its answer.
@@ -119,7 +121,8 @@ Only the user can add these rules, because Claude Code blocks a session from edi
 Run the task in its own git worktree on its own branch, and grant `write_file` for that worktree only.
 Ask Gemini to write the changes in place and to end with a reply of a few lines listing the files changed and anything not done; do not ask for a diff or file contents in the reply.
 A turn's reply and its thinking share one output limit, so a reply that carries a long diff can hit it; agy then fails with "exceeded the output token limit", and later turns in that conversation have failed the same way.
-agy-call still checks a reply agy wrote before that error (it is in agy's JSON in `agy-N.out`); when there is none, it exits 20 without resending.
+agy-call still checks a reply agy wrote before that error (it is in `reply.txt`); when there is none, it exits 20 without resending.
+A reply that comes back with an agy error is accepted only by a check you asked for (`--expect`, `--require`, `--schema` or `--check-cmd`), and no follow-up is sent in that conversation.
 Pass a `--check-cmd` that builds and runs the tests in the worktree and ignores stdin when the reply is only a summary; a failing build then goes back to Gemini in the same conversation as a finding.
 Give the check a `--check-timeout` long enough for the build, give the call a `--timeout` that covers the whole task (a coding turn can run an hour), and run agy-call with run_in_background.
 In shell scripts pass each option and its value as separate words: `--conversation "$ID"`, not one string holding both.

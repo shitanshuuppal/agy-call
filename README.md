@@ -23,11 +23,11 @@ The optional guard hook stops Claude from calling `agy` directly, so every call 
 agy-call is a standard-library Python wrapper through which every call to agy (Antigravity, Gemini) goes, so no paid reply is lost and a quota error stops all callers.
 Run the tests with `uvx pytest -q tests/`.
 `skills/agy-call/SKILL.md` is the user guide.
-`docs/demo/` regenerates the demo GIF with the test suite's fake delegate, so it spends no Gemini quota.
+`docs/demo/` regenerates the demo GIF with the test suite's stand-in for agy, so it spends no Gemini quota.
 
 ## Install
 
-Requirements: Python 3 (standard library only), the `agy` CLI installed and signed in, and the Antigravity Claude Code plugin (`antigravity-for-claude-code`), which puts its delegate script on the PATH inside Claude Code sessions.
+Requirements: Python 3.9 or newer (standard library only), macOS or Linux, and the `agy` CLI 1.5.6 or newer, installed and signed in; agy-call finds it on the PATH or through `AGYCALL_AGY`.
 
 ### As a Claude Code plugin
 

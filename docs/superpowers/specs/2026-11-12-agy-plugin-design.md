@@ -288,7 +288,7 @@ For task and review jobs, `--max-turns` (default 3) counts every launch in the c
 
 `agy.py` builds `[agy, "--model", M, "--print-timeout", T, "--output-format", "json"]`, then `--settings F`, `--effort E`, `--json-schema S`, `--mode MODE`, `--add-dir D` and `--conversation ID` when given, then `-p <prompt>`.
 The agy path comes from `AGYCALL_AGY` or `agy` on PATH; `AGY_DELEGATE` and `AGYCALL_REAL_AGY` are no longer read.
-The prompt is passed as one argument and stdin is `/dev/null`; a prompt over 512 KiB is refused before launch with exit 2 and a message to put the material in a file under the working directory.
+The prompt is passed as one argument and stdin is `/dev/null`; a prompt longer than one argument may be on the platform (131071 bytes on Linux, which caps one argument at 32 pages including its NUL; 512 KiB on macOS) is refused before launch with exit 2 and a message to put the material in a file under the working directory.
 stdout and stderr go straight to `attempts/NNN/agy.out` and `agy.err`; the argument list goes to `agy.args` with the prompt replaced by its length and SHA-256 (the prompt itself is in `launch.json`).
 After the run, the envelope's `response`, when present, is also written to `reply.txt`, so a person can read the reply without parsing JSON.
 agy runs in its own process group; `launch.json` records the pid, the process group id and the process start time (from `ps -o lstart= -p <pid>`), written immediately after the process starts.
