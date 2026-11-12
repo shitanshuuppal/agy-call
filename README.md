@@ -93,7 +93,7 @@ rmdir ~/.claude/skills/agy-call
 Also remove the guard hook's entry from `hooks.PreToolUse` in `~/.claude/settings.json`.
 If you keep the `~/.local/bin/agy-call` link for use outside Claude Code, update your clone (`git pull`) so it runs the same version as the plugin.
 `AGY_DELEGATE` and `AGYCALL_REAL_AGY` are no longer read; set `AGYCALL_AGY` if agy is not on the PATH.
-The release notes (`docs/release-notes-0.2.0.md`) list every change.
+The release notes (`docs/release-notes-0.2.0.md` and `docs/release-notes-0.2.1.md`) list every change.
 
 ### Manual install
 

@@ -22,7 +22,7 @@ def front_matter(*parts):
 
 def test_the_plugin_is_named_agy_in_the_agy_call_marketplace():
     plugin = json.loads(read(".claude-plugin", "plugin.json"))
-    assert (plugin["name"], plugin["version"]) == ("agy", "0.2.0")
+    assert (plugin["name"], plugin["version"]) == ("agy", "0.2.1")
     market = json.loads(read(".claude-plugin", "marketplace.json"))
     assert market["name"] == "agy-call"
     assert [(p["name"], p["source"]) for p in market["plugins"]] == [("agy", "./")]
