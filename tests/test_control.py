@@ -216,3 +216,20 @@ def test_cancel_without_an_id_counts_a_live_controller_whatever_the_recorded_sta
     _fake_job(tmp_path, "rerun", session="s1", state="check-error", controller=_me())
     _fake_job(tmp_path, "old", session="s1", state="failed")
     assert control._only_running(S(tmp_path)).id == "rerun"
+
+
+def test_cancel_keeps_a_job_that_finishes_between_its_state_read_and_its_orphan_check(tmp_path, monkeypatch):
+    job = _fake_job(tmp_path, state="running", controller=_me())
+    real = agy.owns
+
+    def owns(rec):
+        if rec and rec.get("pid") == os.getpid():  # the orphan check: the job finishes just before it
+            store.write_atomic(job.path("answer.txt"), "the answer")
+            job.set_status(state="done", answer=True, controller=None)
+            return False
+        return real(rec)
+
+    monkeypatch.setattr(control.agy, "owns", owns)
+    assert bounded(lambda: control.cancel(S(tmp_path), "j1")) == ("finished before cancel (done)", 0)
+    assert job.status()["state"] == "done" and open(job.path("answer.txt")).read() == "the answer"
+    assert not os.path.exists(job.path("cancel.request"))

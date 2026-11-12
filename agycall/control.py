@@ -137,11 +137,16 @@ def _only_running(store):
     return running[0]
 
 
-def _stop_orphans(job):
+def _stop_orphans(job, before):
     """No controller is alive, so nothing will act on cancel.request: stop the newest attempt's check and agy process
     groups while they are still the recorded processes, record the attempt and the job as cancelled, and return the pid
     of a group that outlived SIGKILL, or "unknown" when the job lock is still held after every recorded process was
-    stopped (a launch whose pid was never recorded), else None. In both cases the job's state is left as it was."""
+    stopped (a launch whose pid was never recorded), else None. In both cases the job's state is left as it was.
+    `before` is the state cancel read first: a job that has an answer or has left that state for a non-active one
+    finished meanwhile, and is returned as ("finished", state) with nothing changed. The check is made under the job
+    lock, which stays held through the record updates."""
+    if _finished(job, before):
+        return "finished", job.status().get("state")
     atts = job.launched()
     att = runner.pending(job)
     recs = []
@@ -154,14 +159,20 @@ def _stop_orphans(job):
             return rec["pid"]
     try:
         with st.flock(job.lock_path, blocking=False):
-            pass
+            if _finished(job, before):
+                return "finished", job.status().get("state")
+            if att and not os.path.exists(os.path.join(att, "result.json")):  # a rerun that started meanwhile may have settled it
+                st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "cancelled", "classified": "cancelled",
+                                                                   "findings": [runner.CANCELLED], "ended": runner._now()})
+            job.set_status(state="cancelled", findings=[runner.CANCELLED])
     except st.Busy:
         return "unknown"
-    if att and not os.path.exists(os.path.join(att, "result.json")):  # a rerun that started meanwhile may have settled it
-        st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "cancelled", "classified": "cancelled",
-                                                           "findings": [runner.CANCELLED], "ended": runner._now()})
-    job.set_status(state="cancelled", findings=[runner.CANCELLED])
     return None
+
+
+def _finished(job, before):
+    state = job.status().get("state")
+    return os.path.exists(job.path("answer.txt")) or (state != before and state not in ACTIVE)
 
 
 def cancel(store, job_id=None, wait=CANCEL_WAIT):
@@ -173,7 +184,10 @@ def cancel(store, job_id=None, wait=CANCEL_WAIT):
         return s.get("state") or "unknown", 0
     st.write_atomic(job.path("cancel.request"), {"requested": runner._now()})
     if not agy.owns(job.status().get("controller")):
-        stuck = _stop_orphans(job)
+        stuck = _stop_orphans(job, s.get("state"))
+        if isinstance(stuck, tuple):
+            os.unlink(job.path("cancel.request"))  # it must not cancel a later rerun of a finished job
+            return "finished before cancel (%s)" % stuck[1], 0
         if stuck:
             return "still stopping (pid %s)" % stuck, 25
     end = time.monotonic() + wait
