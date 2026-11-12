@@ -605,7 +605,12 @@ def _pending(tmp_path, out, check_cmd=None, started=None, conversation=None):
     store.write_atomic(job.path("request.json"), {"identity": store.identity(
         "q", "m", os.path.abspath(os.getcwd()), [], conversation, _cident(check_cmd), None)})
     dead = subprocess.Popen(["true"], start_new_session=True)
-    dead.wait(timeout=30)
+    try:
+        dead.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        dead.kill()
+        dead.wait()
+        raise
     att = job.new_attempt()
     store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "q",
                                                          "conversation": conversation, "generation": 0,
