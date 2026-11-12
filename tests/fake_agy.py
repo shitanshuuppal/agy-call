@@ -12,8 +12,22 @@ import sys
 import time
 
 args = sys.argv[1:]
-if "-p" not in args:  # --help, --version and models probes
-    print("agy stand-in")
+if "-p" not in args:  # the probes of agy-call setup; FAKE_VERSION, FAKE_HELP_DROP, FAKE_MODELS, FAKE_MODELS_FAIL vary them
+    if args == ["--version"]:
+        print(os.environ.get("FAKE_VERSION", "1.5.6"))
+    elif args == ["--help"]:  # real agy prints its help on stderr
+        drop = os.environ.get("FAKE_HELP_DROP")
+        flags = [f for f in ("--settings", "--json-schema", "--effort", "--output-format") if f != drop]
+        sys.stderr.write("Usage of agy:\n" + "".join("  %s  stand-in flag\n" % f for f in flags))
+    elif args == ["models"]:
+        if os.environ.get("FAKE_MODELS_FAIL"):
+            sys.stderr.write("Error: unauthenticated; run agy once to sign in\n")
+            sys.exit(1)
+        sys.stderr.write("Fetching available models...\n")
+        for name in os.environ.get("FAKE_MODELS", "gemini-4-argon-high gemini-3.8-flash-low").split():
+            print("%s\t%s" % (name, name))
+    else:
+        print("agy stand-in")
     sys.exit(0)
 turns = json.load(open(os.environ["FAKE_SCENARIO"]))
 state = os.environ["FAKE_STATE"]

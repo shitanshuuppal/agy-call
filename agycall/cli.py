@@ -10,6 +10,7 @@ from . import store as st
 from .batch import batch
 from .errors import AgyCallError, Cancelled, Quota, RepoState, Running
 from .runner import call
+from . import setup
 
 
 def _common(p):
@@ -147,6 +148,7 @@ def main(argv):
     b.add_argument("jobs_file")
     b.add_argument("--workers", type=int, default=4)
     _common(b)
+    sub.add_parser("setup")  # checks agy and this machine without sending a prompt
     for name in ("status", "result", "cancel"):
         p = sub.add_parser(name)
         p.add_argument("job", nargs="?")
@@ -189,6 +191,10 @@ def main(argv):
     a = ap.parse_args(argv)
     if a.cmd == "batch":
         return _batch(a)
+    if a.cmd == "setup":
+        text, code = setup.check()
+        print(text)
+        return code
     try:
         if a.cmd == "worker":
             return control.work(a.store, a.job)
