@@ -234,8 +234,9 @@ def _check(c, att, text, res):
     shows `checking` while it runs, and a cancel request stops it and is recorded in res."""
     def started(pid, when):
         st.write_atomic(os.path.join(att, "check.json"), {"pid": pid, "pgid": pid, "pstart": when, "started": _now()})
-        c.job.set_status(state="checking")
 
+    if c.cident["cmd"]:
+        c.job.set_status(state="checking")  # before the command starts: it may read the status at once
     try:
         return c.checker(text, cwd=c.cwd, fds=c.fds, on_start=started, should_stop=c.should_stop)
     except Cancelled:

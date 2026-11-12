@@ -605,7 +605,7 @@ def _pending(tmp_path, out, check_cmd=None, started=None, conversation=None):
     store.write_atomic(job.path("request.json"), {"identity": store.identity(
         "q", "m", os.path.abspath(os.getcwd()), [], conversation, _cident(check_cmd), None)})
     dead = subprocess.Popen(["true"], start_new_session=True)
-    dead.wait()
+    dead.wait(timeout=30)
     att = job.new_attempt()
     store.write_atomic(os.path.join(att, "launch.json"), {"pid": dead.pid, "pgid": dead.pid, "kind": "first", "message": "q",
                                                          "conversation": conversation, "generation": 0,
@@ -790,3 +790,14 @@ def test_cancel_request_found_during_recovery(tmp_path, fake):
     res = store.read_json(os.path.join(att, "result.json"))
     assert res["classified"] == "cancelled" and res["recovered"] is True and launches() == []
     assert open(os.path.join(att, "reply.txt")).read() == "paid reply"
+
+
+def test_checking_is_published_before_a_slow_start_is_recorded(tmp_path, fake, monkeypatch):
+    set_turns, _ = fake
+    set_turns(reply("x"))
+    real = agy.start_time
+    monkeypatch.setattr(agy, "start_time", lambda pid: (time.sleep(1), real(pid))[1])  # the command runs during this wait
+    status = os.path.join(S(tmp_path), "j1", "status.json")
+    cmd = "grep -q '\"state\": \"checking\"' " + shlex.quote(status)
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", cwd=str(tmp_path), check_cmd=cmd)
+    assert r.answer == "x"
