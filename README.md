@@ -15,6 +15,7 @@ agy-call sits between Claude and Gemini and handles both:
 - When a reply is unusable, it goes back to the same conversation and tells Gemini what to fix, instead of starting over.
 - When one call hits the quota limit, it records a hold for the whole machine; every other call checks the hold before launching and waits until the limit resets.
 - It can check answers for you, for example requiring valid JSON with certain fields, and sends a reply back when the format is wrong.
+- A call can run in the background; `agy-call status`, `result` and `cancel` show how it is going, print its answer and stop it.
 
 The optional guard hook stops Claude from calling `agy` directly, so every call goes through agy-call.
 

@@ -19,7 +19,7 @@ The hook matches the whole command text, so a command that only mentions `agy-de
 
 `agy-call run --job ID [options]` reads the prompt from `--prompt-file`, `--prompt` or stdin (in that order of preference; the first two are mutually exclusive).
 It prints the accepted answer on stdout, errors on stderr, and exits with the code in the table below.
-Run it with run_in_background for long jobs.
+Run it with run_in_background for long jobs, or pass `--background` to hand the job to a detached worker (see Status, result and cancel).
 A bad argument, job id or timeout, or a prompt larger than one command-line argument allows (512 KiB on macOS, 128 KiB on Linux), exits 2 before anything is launched.
 
 Options of `run` and `batch` (defaults in brackets):
@@ -34,7 +34,7 @@ Options of `run` and `batch` (defaults in brackets):
 - `--expect json`: the reply must contain a JSON value (the last fenced `json` block that parses, the whole reply, or unfenced JSON surrounded by prose when it is the whole span from the first `{`/`[` to the last `}`/`]`); the accepted answer is that value re-printed as JSON.
 - `--require a,b`: comma-separated top-level keys the JSON object must have (implies `--expect json`).
 - `--schema FILE`: JSON Schema file (a subset) the JSON value must satisfy (implies `--expect json`).
-- `--check-cmd CMD`: shell command that receives the candidate answer on stdin; exit 0 accepts it, exit 1 rejects it and its stdout becomes the finding sent back to agy, any other exit is a check error (21) [none].
+- `--check-cmd CMD`: shell command, run in the working directory of the call (`--cwd`), that receives the candidate answer on stdin; exit 0 accepts it, exit 1 rejects it and its stdout becomes the finding sent back to agy, any other exit is a check error (21) [none].
 - `--check-timeout SECONDS`: limit for the check command [120].
 - `--max-turns N`: most turns per job, counting follow-ups but not plain retries [4].
 - `--ignore-quota`: launch even while a quota hold exists [off].
@@ -45,6 +45,7 @@ Options of `run` only:
 - `--job ID`: required; `[A-Za-z0-9][A-Za-z0-9._-]{0,119}` (the first character is a letter or digit).
 - `--conversation ID`: seed the job with an existing conversation, to continue it [none].
 - `--new-version`: when the job exists with a different request, move the old job folder under `.versions` and start again [off].
+- `--background`: check the request as a normal run would, record the job as `queued`, start a detached worker that runs it, print the job id and exit 0; the worker keeps running after the Claude session ends, and its own messages go to `<store>/<job>/worker.log`; an argument that cannot be stored as JSON exits 2 [off].
 
 `agy-call batch JOBS.jsonl [--workers N] [common options]` runs many jobs [`--workers` default 4].
 Each line of the file is a JSON object with `job` (required, unique within the batch; duplicates are rejected before anything runs) and `prompt` or `prompt_file`.
@@ -53,7 +54,7 @@ Any other key on a line is an option for that job and overrides the common optio
 Batch prints one line per outcome with its count (`done 3`, `Quota 2`, ...), then one line per job that did not finish.
 Jobs that already have an answer are returned without a launch even during a quota hold.
 Once a model key has a quota hold, batch launches no further job for that key and lists those jobs as `Quota`.
-Batch exits 0 when every job is done, 10 when any job hit a quota hold, and 20 otherwise.
+Batch exits 0 when every job is done, 10 when any job hit a quota hold, 27 when none did and any job was cancelled, and 20 otherwise.
 
 ## Python
 
@@ -68,7 +69,7 @@ from agycall import call, batch, AgyCallError, Quota
 `check` is a Python function that receives the parsed value (or the text) and returns a list of problems; it needs a stable `check_id` string, which is part of the job's identity, so change the `check_id` when the function's rules change.
 `batch(jobs, *, workers=4, **common)` takes a list of dicts as in the JSONL format and returns `{job_id: Result or exception}`; it never raises for a single job.
 
-Exceptions, all subclasses of `AgyCallError` with the CLI exit code in `.code`: `Running` (25), `Mismatch` (24), `Quota` (10, with `.key` and `.until`), `Fatal` (the failure's exit code, with `.reason`), `GaveUp` (20, with `.findings`, `.conversation`, `.usage`, `.job_dir`), `CheckError` (21), `NoConversation` (23).
+Exceptions, all subclasses of `AgyCallError` with the CLI exit code in `.code`: `Running` (25), `Mismatch` (24), `Quota` (10, with `.key` and `.until`), `Fatal` (the failure's exit code, with `.reason`), `GaveUp` (20, with `.findings`, `.conversation`, `.usage`, `.job_dir`), `CheckError` (21), `NoConversation` (23), `Cancelled` (27).
 
 ## Job ids and stores
 
@@ -76,6 +77,44 @@ A job id names one request and is how a rerun finds the saved work: calling agai
 Choose ids that are stable across reruns and include the version of the item asked about, for example `q-0412-3fa9c1` with a short sha of the source text.
 A job whose prompt, model, directories, seed conversation, check or mode changed is a different request; agy-call refuses it with exit 24 unless you pass `--new-version`.
 Keep the store inside the project (for example `<project>/agy-jobs`) so the replies live with the work and are not mixed with other projects.
+
+## Status, result and cancel
+
+`agy-call status [JOB] [--store DIR] [--namespace NAME]` lists the jobs of a store, one line each: the id, the state, the age and the last finding.
+Jobs started in the current Claude session (the `AGYCALL_SESSION` variable, recorded in `request.json`) come first, then the others, newest first in each group.
+With a job id it prints every field of the job's `status.json` and the processes still running for it: the controller (the agy-call process running the job), agy and the check command.
+A queued, running or checking job with none of these alive lost its process; rerun the same command to recover it.
+
+`agy-call result [JOB]` prints the accepted answer of a `done` job and exits 0.
+For any other state it prints the state, the findings and the last saved reply, and exits with that state's code: 10 quota, 20 failed, 21 check error, 23 no conversation, 25 queued, running or checking, 27 cancelled, and for `fatal` the setup code the job recorded (11, 13, 14 or 22).
+An `interrupted` job exits 1.
+Without a job id it uses the newest finished job of the current session.
+
+`agy-call cancel [JOB]` asks a queued, running or checking job to stop by writing `<store>/<job>/cancel.request`, without waiting for the job's lock.
+It then waits up to 20 seconds and prints `cancelled`, `finished before cancel (STATE)` when the job ended another way first, or `still stopping (pid N)` with exit 25.
+When something still holds the job but no process owned by it can be found, it prints `still stopping (pid unknown)` and exits 25.
+On a job that is not running it changes nothing and prints the job's state.
+Without a job id it cancels the only running job of the current session, and refuses when there are several.
+agy-call looks for the request before each launch, every second while agy or the check command runs, and once more just before it saves the answer; agy and the check command get SIGTERM, then SIGKILL after 10 seconds.
+When the process running the job has died but agy or the check command still runs, `cancel` stops them itself.
+A cancelled job stays cancelled: a rerun exits 27 without a launch, so to do the work anyway run it under a new job id.
+Replies already received are kept.
+
+### Job states
+
+| State | Meaning |
+|-------|---------|
+| `queued` | a background worker was started; agy has not been launched yet |
+| `running` | agy is running |
+| `checking` | the check command is running |
+| `done` | a reply passed its checks; `answer.txt` holds the answer |
+| `failed` | gave up (exit 20); the replies are kept |
+| `quota` | a quota hold stopped the job |
+| `check-error` | the check itself failed to run |
+| `no-conversation` | a follow-up was needed but no conversation id was captured |
+| `fatal` | agy is missing or not signed in, the model is unknown, or agy's output was not a JSON envelope |
+| `cancelled` | stopped by `cancel` |
+| `interrupted` | the process running the job died and the saved output did not settle the turn; the rerun that found it restarts the turn |
 
 ## Exit codes
 
@@ -86,12 +125,13 @@ Keep the store inside the project (for example `<project>/agy-jobs`) so the repl
 | 11 | agy is not authenticated |
 | 13 | agy is missing: set `AGYCALL_AGY` or put agy on PATH |
 | 14 | model unavailable |
-| 20 | gave up: no usable reply within `--max-turns`, a tool call denied twice, or agy hit its output limit without a reply |
+| 20 | gave up: no usable reply within `--max-turns`, a tool call denied twice, agy hit its output limit without a reply, or agy answered in another conversation |
 | 21 | check error: the check itself failed to run; the reply is kept |
 | 22 | agy's output was not a JSON envelope; the raw output is kept in `agy.out` |
 | 23 | no conversation id was captured, so a follow-up cannot be sent |
 | 24 | the job exists with a different request |
-| 25 | the job is running in another process |
+| 25 | the job is running in another process; from `result`, the job is still queued, running or checking; from `cancel`, it is still stopping |
+| 27 | the job was cancelled |
 
 An error that is not one of these (for example a bad argument) exits with 1 or 2.
 
@@ -102,15 +142,21 @@ Attempts made before agy-call launched agy itself keep their older files (`deleg
 The accepted answer is `<store>/<job>/answer.txt`; `request.json` and `status.json` sit beside it.
 Nothing is ever deleted: a replaced job moves under `.versions`, and failed attempts stay in place.
 When a call fails, read `reply.txt` and `agy.err` of the last attempt to see what agy actually said.
+`check.json` in the attempt folder records the check command's process while it runs.
+A cancelled job has `cancel.request`, and a background job has `background.json` (the arguments its worker passes to `call()`) and `worker.log`, beside `request.json`.
+When the process running a job died, the next run of the same job reads the saved `agy.out` before launching anything.
+A complete reply found there is checked as if it had just arrived, but agy's exit status was lost, so it is accepted only by a check you asked for and no follow-up is sent after it.
+Output that is not a complete reply restarts the turn.
 
 ## What to do per exit
 
 - 10: wait until the printed time and rerun the same command, or ask the author; do not use `--ignore-quota` to get around it.
-- 20: read the findings; after an output-limit stop, send a new prompt that asks for a short reply, as a new job (see Coding tasks); otherwise rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`.
+- 20: read the findings; after an output-limit stop, send a new prompt that asks for a short reply, as a new job (see Coding tasks); otherwise rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`. After a stop because agy answered in another conversation, a rerun sends nothing; start a new job.
 - 21: a rerun checks the saved reply again before any new turn, but only when the request is unchanged: repair the checker's executable or environment, not the command string, schema file or `check_id`. After changing the check, the saved reply is in `attempts/NNN/reply.txt` and the raw output in `agy.out`; a rerun with `--new-version` starts a new paid job.
 - 23: rerun with `--fresh` if starting a new conversation is acceptable; otherwise use the replies saved under `attempts/`.
 - 24: the request changed; use a new job id, or `--new-version` to replace the old job.
 - 25: another process holds the job; wait for it and rerun, which then returns its answer.
+- 27: the job was cancelled and stays cancelled; its replies are kept under `attempts/`; to do the work anyway, run it under a new job id.
 - 11, 13, 14, 22: fix the setup (login, install, model name) and rerun; the job is kept.
 
 ## Coding tasks
