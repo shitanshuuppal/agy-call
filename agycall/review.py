@@ -147,7 +147,7 @@ def _check_existing(top, rv):
               and mine == theirs and not worktree.current_branch(wt)
               and worktree.git(wt, "rev-parse", "HEAD", env=env).strip() == rv["snapshot"]
               and not worktree.git(wt, "status", "--porcelain", env=env).strip())
-    except RepoState:
+    except (RepoState, OSError):  # OSError: the path is a regular file or a dangling symlink
         ok = False
     if not ok:
         raise RepoState("%s exists but is not the clean snapshot worktree of review at %s; move it away or pass "

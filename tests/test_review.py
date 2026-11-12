@@ -189,6 +189,44 @@ def test_a_review_runs_in_its_snapshot_with_the_read_only_grant_and_the_schema(r
     assert "Assume the change has defects" not in first["prompt"]
 
 
+def test_a_grant_added_between_turns_is_denied_in_the_next_launch(repo, fake, tmp_path):
+    set_turns, launches = fake
+    cfg = tmp_path / "agy-config.json"
+    cfg.write_text(json.dumps({"userSettings": {"globalPermissionGrants": {"allow": ["command(gcloud run)"]}}}))
+    _changed(repo, "a.txt")
+    set_turns(reply("no json here"), reply(_review_json(["a.txt"])))
+    job = review.start(model="m")
+    settle = runner._settle
+
+    def settle_then_grant(*a, **kw):  # the user grants another command while the review is between turns
+        r = settle(*a, **kw)
+        cfg.write_text(json.dumps({"userSettings": {"globalPermissionGrants": {
+            "allow": ["command(gcloud run)", "command(kubectl apply)"]}}}))
+        return r
+    runner._settle = settle_then_grant
+    try:
+        assert review.drive(job).text
+    finally:
+        runner._settle = settle
+    first, second = launches()
+    assert first["settings"]["permissions"]["deny"] == ["command(gcloud run)"]
+    assert second["settings"]["permissions"]["deny"] == ["command(gcloud run)", "command(kubectl apply)"]
+
+
+def test_a_snapshot_path_that_is_a_file_or_a_dangling_symlink_exits_26(repo):
+    _changed(repo, "a.txt")
+    snap = review.snapshot_path(worktree.repo(), "r1")
+    os.makedirs(os.path.dirname(snap))
+    with open(snap, "w") as f:
+        f.write("not a worktree\n")
+    with pytest.raises(RepoState, match="not the clean snapshot worktree"):
+        review.start(model="m", job_id="r1")
+    os.remove(snap)
+    os.symlink(os.path.join(os.path.dirname(snap), "nowhere"), snap)
+    r = run_cli("review", "--model", "m", "--job", "r1", cwd=str(repo))
+    assert r.returncode == 26 and "Traceback" not in r.stderr and "not the clean snapshot worktree" in r.stderr
+
+
 def test_run_still_passes_no_json_schema_to_agy(tmp_path, fake):
     set_turns, launches = fake
     set_turns(reply('{"a": 1}'))

@@ -235,3 +235,4 @@ def test_run_refuses_an_unenforced_schema_keyword_before_any_launch(tmp_path, fa
     code = cli.main(["run", "--job", "j", "--model", "m", "--prompt", "p", "--schema", str(p),
                      "--store", str(tmp_path / "s")])
     assert code == 2 and "pattern" in capsys.readouterr().err and launches() == []
+    assert not (tmp_path / "s").exists()
