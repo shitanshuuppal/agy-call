@@ -511,6 +511,33 @@ def test_a_snapshot_dirtied_after_creation_is_refused_before_the_next_launch(rep
     assert launches() == []
 
 
+def test_a_review_that_failed_on_its_deadline_stays_stopped_on_rerun(repo, fake, monkeypatch):
+    set_turns, launches = fake
+    _changed(repo, "a.txt")
+    monkeypatch.setattr(review, "DEADLINE", "1s")
+    set_turns(reply("no json here"), reply(_review_json(["a.txt"])))
+    settle = runner._settle
+
+    def slow_settle(*a, **kw):  # the deadline passes between the first turn and the second
+        r = settle(*a, **kw)
+        time.sleep(1.2)
+        return r
+    monkeypatch.setattr(runner, "_settle", slow_settle)
+    job = review.start(model="m")
+    with pytest.raises(GaveUp, match="deadline"):
+        review.drive(job)
+    monkeypatch.setattr(runner, "_settle", settle)
+    assert len(launches()) == 1 and job.status()["state"] == "failed"
+    with pytest.raises(GaveUp):
+        review.drive(review.start(model="m"))
+    assert len(launches()) == 1
+    review.start(model="m", background=True)  # queuing must not reopen it either
+    assert job.status()["state"] == "failed"
+    with pytest.raises(GaveUp):
+        review.drive(job)
+    assert len(launches()) == 1
+
+
 def test_a_failed_foreground_review_prints_the_error_the_result_and_exits_with_its_code(repo, fake):
     set_turns, _ = fake
     _changed(repo, "a.txt")

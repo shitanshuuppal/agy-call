@@ -12,7 +12,7 @@ import tempfile
 
 from . import agy, checks, runner, task, worktree
 from . import store as st
-from .errors import Mismatch, RepoState
+from .errors import Blocked, GaveUp, Mismatch, RepoState
 
 SCOPES = ("auto", "working-tree", "branch")
 SEVERITIES = ("MUST-FIX", "SHOULD-FIX", "NIT")
@@ -224,7 +224,7 @@ def start(*, model, effort=None, scope="auto", base=None, adversarial=False, foc
             st.write_atomic(job.path("request.json"), req)
         if not os.path.exists(job.path("answer.txt")):
             _snapshot(r.top, req["review"])
-        if background:
+        if background and job.status().get("state") not in ("failed", "blocked"):  # those stay stopped (see drive)
             _queue(job)
     return job
 
@@ -274,9 +274,16 @@ def drive(job):
     with contextlib.ExitStack() as stack:
         c.stack = stack
         c.fds.append(runner._lock(job, stack))
+        status = job.status()
+        if not os.path.exists(job.path("answer.txt")) and status.get("state") in ("failed", "blocked"):
+            findings = status.get("findings") or ["the review stopped"]  # a stopped review is never launched again
+            if status["state"] == "blocked":
+                raise Blocked(findings, job.dir)
+            raise GaveUp(findings, status.get("conversation"), runner._usage(job), job.dir)
         if not os.path.exists(job.path("answer.txt")) and not os.path.isdir(rv["worktree"]):
             raise RepoState("the snapshot worktree %s of review %s is missing; run the same review command again "
                             "to make it" % (rv["worktree"], job.id))
+
         def refresh():  # before every launch: the snapshot is still the clean worktree, and the grant follows the config
             if not _check_existing(rv["checkout"], rv):
                 raise RepoState("the snapshot worktree %s of review %s is missing; run the same review command again "
