@@ -1,5 +1,8 @@
 """Builders for tests/fake_agy.py turns, one per shape of agy run the classifier knows, and a bounded wait for tests
 that drive real processes."""
+import os
+import signal
+import threading
 import time
 
 CUT_OFF = ("Your previous response was cut off because it exceeded the output token limit\n"
@@ -54,3 +57,29 @@ def wait_for(predicate, timeout=30):
             return value
         time.sleep(0.05)
     raise AssertionError("condition not met within %s seconds" % timeout)
+
+
+def bounded(fn, pids=(), timeout=30):
+    """Run fn in a daemon thread and return its result (or re-raise its exception). When it has not returned after
+    timeout seconds, kill every process group in pids (the list the test fills from on_start) and fail the test."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:
+            box["error"] = e
+
+    th = threading.Thread(target=target, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        for pid in list(pids):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        raise AssertionError("the launcher call did not return within %s seconds; its process groups were killed" % timeout)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")

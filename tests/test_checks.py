@@ -7,6 +7,7 @@ import pytest
 
 from agycall import agy, checks
 from agycall.errors import Cancelled, CheckError
+from agyturns import bounded
 
 
 def kill_group(pids):
@@ -86,7 +87,7 @@ def test_check_cmd_accept_reject_and_operational_failures():
 def test_check_cmd_timeout_kills_and_raises():
     check, _ = checks.make_check(check_cmd="sleep 30", check_timeout=1)
     with pytest.raises(CheckError, match="timed out"):
-        check("text")
+        bounded(lambda: check("text"))
 
 
 def test_python_check_function():
@@ -148,8 +149,8 @@ def test_check_cmd_runs_in_cwd_with_inherited_fds_and_reports_its_start(tmp_path
 
 def test_check_cmd_that_ignores_a_large_reply_does_not_hang():
     t0 = time.monotonic()
-    assert checks.run_cmd("exit 0", "x" * 2_000_000, 30) == []
-    assert checks.run_cmd("grep -q end", "x" * 2_000_000 + " end", 30) == []
+    assert bounded(lambda: checks.run_cmd("exit 0", "x" * 2_000_000, 30)) == []
+    assert bounded(lambda: checks.run_cmd("grep -q end", "x" * 2_000_000 + " end", 30)) == []
     assert time.monotonic() - t0 < 10
 
 
@@ -159,8 +160,8 @@ def test_check_cmd_cancel_stops_its_process_group(monkeypatch):
     t0 = time.monotonic()
     try:
         with pytest.raises(Cancelled) as e:
-            checks.run_cmd("sleep 30 & sleep 30", "text", 30, on_start=lambda pid, when: seen.append(pid),
-                           should_stop=lambda: "cancel" if seen else None)
+            bounded(lambda: checks.run_cmd("sleep 30 & sleep 30", "text", 30, on_start=lambda pid, when: seen.append(pid),
+                                           should_stop=lambda: "cancel" if seen else None), seen)
         assert e.value.code == 27 and time.monotonic() - t0 < 10 and not agy.alive(seen[0])
     finally:
         kill_group(seen)
@@ -179,8 +180,8 @@ def test_check_cmd_failing_stop_check_stops_the_group_and_propagates(monkeypatch
     t0 = time.monotonic()
     try:
         with pytest.raises(OSError, match="cancel flag unreadable"):
-            checks.run_cmd("sleep 30 & sleep 30", "text", 30, on_start=lambda pid, when: seen.append(pid),
-                           should_stop=should_stop)
+            bounded(lambda: checks.run_cmd("sleep 30 & sleep 30", "text", 30, on_start=lambda pid, when: seen.append(pid),
+                                           should_stop=should_stop), seen)
         assert time.monotonic() - t0 < 10 and not agy.alive(seen[0])
     finally:
         kill_group(seen)
