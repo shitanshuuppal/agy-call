@@ -45,3 +45,15 @@ class NoConversation(AgyCallError):
 
 class Cancelled(AgyCallError):
     code = 27
+
+
+class RepoState(AgyCallError):
+    code = 26
+
+
+class Blocked(AgyCallError):
+    code = 28
+
+    def __init__(self, findings, job_dir=None):
+        super().__init__("blocked on permission: " + "; ".join(findings)[-2000:])
+        self.findings, self.job_dir = list(findings), job_dir

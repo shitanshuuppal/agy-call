@@ -1,7 +1,8 @@
 """Builders for tests/fake_agy.py turns, one per shape of agy run the classifier knows, and a bounded wait for tests
-that drive real processes."""
+that drive real processes, and git for tests that use a repository."""
 import os
 import signal
+import subprocess
 import threading
 import time
 
@@ -83,3 +84,8 @@ def bounded(fn, pids=(), timeout=30):
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+def git(cwd, *args):
+    """Run git in cwd for a test and return its stdout; a failure fails the test."""
+    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True).stdout

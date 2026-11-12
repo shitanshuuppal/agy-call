@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Stand-in for the agy binary. FAKE_SCENARIO is a JSON list of turns; the Nth print-mode launch plays turn N (the last
-turn repeats). A turn has exit (default 0), stderr, sleep, and either the envelope fields status (default SUCCESS),
+turn repeats). A turn has exit (default 0), stderr, sleep, write (files to create in the working directory, as
+{"relative/path": "content"}, written before the sleep), and either the envelope fields status (default SUCCESS),
 response, error, denied_actions, conversation and usage, or raw_hex (the exact stdout bytes, for malformed output).
-Every print-mode launch is logged to FAKE_LOG as {"argv", "prompt", "cwd"}."""
+Every print-mode launch is logged to FAKE_LOG as {"argv", "prompt", "cwd"}, plus "settings" (the parsed --settings
+file) when one is passed."""
 import fcntl
 import json
 import os
@@ -19,9 +21,17 @@ with open(state + ".lock", "w") as lk:  # parallel launches (batch) each get the
     fcntl.flock(lk, fcntl.LOCK_EX)
     n = int(open(state).read() or 0) if os.path.exists(state) else 0
     open(state, "w").write(str(n + 1))
+rec = {"argv": args, "prompt": args[args.index("-p") + 1], "cwd": os.getcwd()}
+if "--settings" in args:
+    with open(args[args.index("--settings") + 1]) as fh:
+        rec["settings"] = json.load(fh)
 with open(os.environ["FAKE_LOG"], "a") as fh:
-    fh.write(json.dumps({"argv": args, "prompt": args[args.index("-p") + 1], "cwd": os.getcwd()}) + "\n")
+    fh.write(json.dumps(rec) + "\n")
 t = turns[min(n, len(turns) - 1)]
+for name, content in t.get("write", {}).items():
+    os.makedirs(os.path.dirname(os.path.abspath(name)), exist_ok=True)
+    with open(name, "w") as fh:
+        fh.write(content)
 time.sleep(t.get("sleep", 0))
 sys.stderr.write(t.get("stderr", ""))
 if "raw_hex" in t:
