@@ -1,9 +1,12 @@
-"""agy-call run | batch. Prints the accepted answer on stdout; errors on stderr; exit codes in SKILL.md."""
+"""agy-call run | batch | status | result | cancel. Prints the accepted answer or the report on stdout; errors on
+stderr; exit codes in SKILL.md."""
 import argparse
 import collections
 import json
 import sys
 
+from . import control
+from . import store as st
 from .batch import batch
 from .errors import AgyCallError, Quota
 from .runner import call
@@ -33,40 +36,20 @@ def _opts(a):
     return {k: getattr(a, k) for k in keys}
 
 
-def main(argv):
-    ap = argparse.ArgumentParser(prog="agy-call", description=__doc__)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
-    r.add_argument("--job", required=True)
-    src = r.add_mutually_exclusive_group()
-    src.add_argument("--prompt-file")
-    src.add_argument("--prompt")
-    r.add_argument("--conversation")
-    r.add_argument("--new-version", action="store_true")
-    _common(r)
-    b = sub.add_parser("batch")
-    b.add_argument("jobs_file")
-    b.add_argument("--workers", type=int, default=4)
-    _common(b)
-    a = ap.parse_args(argv)
-    if a.cmd == "run":
-        if a.prompt is not None:
-            prompt = a.prompt
-        elif a.prompt_file:
-            with open(a.prompt_file, encoding="utf-8") as fh:
-                prompt = fh.read()
-        else:
-            prompt = sys.stdin.read()
-        try:
-            res = call(a.job, prompt, conversation=a.conversation, new_version=a.new_version, **_opts(a))
-        except AgyCallError as e:
-            print("agy-call: %s" % e, file=sys.stderr)
-            return e.code
-        except ValueError as e:  # a bad argument, job id, timeout or prompt size
-            print("agy-call: %s" % e, file=sys.stderr)
-            return 2
-        sys.stdout.write(res.text if res.text.endswith("\n") else res.text + "\n")
-        return 0
+def _run(a):
+    if a.prompt is not None:
+        prompt = a.prompt
+    elif a.prompt_file:
+        with open(a.prompt_file, encoding="utf-8") as fh:
+            prompt = fh.read()
+    else:
+        prompt = sys.stdin.read()
+    res = call(a.job, prompt, conversation=a.conversation, new_version=a.new_version, **_opts(a))
+    sys.stdout.write(res.text if res.text.endswith("\n") else res.text + "\n")
+    return 0
+
+
+def _batch(a):
     with open(a.jobs_file, encoding="utf-8") as fh:
         jobs = [json.loads(l) for l in fh if l.strip()]
     try:
@@ -83,3 +66,40 @@ def main(argv):
     if all(not isinstance(v, Exception) for v in res.values()):
         return 0
     return 10 if any(isinstance(v, Quota) for v in res.values()) else 20
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="agy-call", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--job", required=True)
+    src = r.add_mutually_exclusive_group()
+    src.add_argument("--prompt-file")
+    src.add_argument("--prompt")
+    r.add_argument("--conversation")
+    r.add_argument("--new-version", action="store_true")
+    _common(r)
+    b = sub.add_parser("batch")
+    b.add_argument("jobs_file")
+    b.add_argument("--workers", type=int, default=4)
+    _common(b)
+    for name in ("status", "result", "cancel"):
+        p = sub.add_parser(name)
+        p.add_argument("job", nargs="?")
+        p.add_argument("--store")
+        p.add_argument("--namespace")
+    a = ap.parse_args(argv)
+    if a.cmd == "batch":
+        return _batch(a)
+    try:
+        if a.cmd == "run":
+            return _run(a)
+        text, code = getattr(control, a.cmd)(st.store_dir(a.store, a.namespace), a.job)
+    except AgyCallError as e:
+        print("agy-call: %s" % e, file=sys.stderr)
+        return e.code
+    except ValueError as e:  # a bad argument, job id, timeout, prompt size, or an unknown job
+        print("agy-call: %s" % e, file=sys.stderr)
+        return 2
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return code

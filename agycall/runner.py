@@ -327,8 +327,10 @@ def _settle(c, att, oc, recovered=False):
         reason = oc.reason
         if name == "malformed":
             reason += "; the raw output is in %s" % os.path.join(att, "agy.out")
+        code = {"auth": 11, "model": 14}.get(name, 22)
         finish("fatal", outcome="fatal", findings=[reason])
-        raise Fatal({"auth": 11, "model": 14}.get(name, 22), reason)
+        job.set_status(code=code)
+        raise Fatal(code, reason)
     return None
 
 
@@ -376,7 +378,7 @@ def _admit(c, stack, new_version):
         os.makedirs(job.dir, exist_ok=True)
         st.write_atomic(job.path("request.json"), {"identity": c.ident, "prompt": c.prompt, "key": c.key, "cwd": c.cwd,
                                                    "dirs": c.dirs, "seed": c.seed, "check": c.cident, "mode": c.mode,
-                                                   "created": _now()})
+                                                   "created": _now(), "session": os.environ.get("AGYCALL_SESSION") or None})
 
 
 def _drive(c, max_turns, ignore_quota, fresh):
@@ -469,7 +471,7 @@ def _drive(c, max_turns, ignore_quota, fresh):
             oc = _launch(c, att, message, kind, generation)
         except Fatal as e:
             st.write_atomic(os.path.join(att, "result.json"), {"exit": None, "outcome": "fatal", "findings": [e.reason], "ended": _now()})
-            job.set_status(state="fatal", findings=[e.reason])
+            job.set_status(state="fatal", findings=[e.reason], code=e.code)
             raise
         r = _settle(c, att, oc)
         if r:
@@ -484,4 +486,8 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                  check_cmd=check_cmd, check_timeout=check_timeout, check=check, check_id=check_id)
     with contextlib.ExitStack() as stack:
         _admit(c, stack, new_version)
+        # cancel reads this to know whether a live process will act on cancel.request; the callback runs before the
+        # job lock is released, because the stack unwinds in reverse order
+        c.job.set_status(controller={"pid": os.getpid(), "pstart": agy.start_time(os.getpid())})
+        stack.callback(c.job.set_status, controller=None)
         return _drive(c, max_turns, ignore_quota, fresh)

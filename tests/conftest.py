@@ -13,6 +13,7 @@ def agy_home(tmp_path, monkeypatch):
     """Every test gets its own ~/.agy-call."""
     home = tmp_path / "home"
     monkeypatch.setenv("AGYCALL_HOME", str(home))
+    monkeypatch.delenv("AGYCALL_SESSION", raising=False)  # a developer's own session must not leak into tests
     return home
 
 
