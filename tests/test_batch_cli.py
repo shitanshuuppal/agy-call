@@ -99,3 +99,14 @@ def test_cli_batch_exits_27_when_a_job_was_cancelled(tmp_path, fake):
     jf.write_text(json.dumps({"job": "j0", "prompt": "p"}) + "\n")
     r = run_cli("batch", str(jf), "--store", str(tmp_path / "s"), "--model", "m")
     assert r.returncode == 27 and "Cancelled" in r.stdout and launches() == []
+
+
+@pytest.mark.parametrize("bad", [{"mode": 123}, {"conversation": 5}])
+def test_cli_batch_exits_2_for_a_non_text_value_and_still_runs_the_other_rows(tmp_path, fake, bad):
+    set_turns, launches = fake
+    set_turns(reply("ok"))
+    jf = tmp_path / "jobs.jsonl"
+    jf.write_text(json.dumps({"job": "j0", "prompt": "p", **bad}) + "\n" + json.dumps({"job": "j1", "prompt": "p"}) + "\n")
+    r = run_cli("batch", str(jf), "--store", str(tmp_path / "s"), "--model", "m", "--workers", "1")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert len(launches()) == 1 and "done 1" in r.stdout

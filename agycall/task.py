@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 
 from . import agy, checks, runner, worktree
 from . import store as st
@@ -216,6 +217,14 @@ def start(job_id, text, *, model, check_cmd, allow=(), effort=None, check_timeou
 QUEUE_GRACE = 30  # seconds a queued segment is kept for a worker that is still starting
 
 
+def _worker_alive(rec):
+    """agy.owns, but an exited worker its parent has not reaped (a zombie keeps its pid and start time) is dead."""
+    if not agy.owns(rec):
+        return False
+    stat = subprocess.run(["ps", "-o", "stat=", "-p", str(rec["pid"])], capture_output=True, text=True, timeout=5).stdout
+    return not stat.strip().startswith("Z")
+
+
 def _release_stale(job):
     """A queued segment can still be taken while a live controller or background worker owns the job (worker.json, written
     by control.spawn) or while it is younger than QUEUE_GRACE seconds: refuse then. Otherwise its worker died before it
@@ -223,7 +232,7 @@ def _release_stale(job):
     n = segments(job)[-1]
     seg = st.read_json(_segment_path(job, n))
     age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(seg["started"])).total_seconds()
-    if agy.owns(job.status().get("controller")) or agy.owns(st.read_json(job.path("worker.json"), {})) or age < QUEUE_GRACE:
+    if agy.owns(job.status().get("controller")) or _worker_alive(st.read_json(job.path("worker.json"), {})) or age < QUEUE_GRACE:
         raise Running("a continuation is already queued for task %s; wait for it to start (or run the task "
                       "again to recover a controller that never did)" % job.id)
     seg.update(taken=False, released=runner._now(), releasedWhy="its worker died before it started")

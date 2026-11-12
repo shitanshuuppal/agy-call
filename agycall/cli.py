@@ -70,6 +70,8 @@ def _batch(a):
             print("  %s: %s" % (job_id, v))
     if all(not isinstance(v, Exception) for v in res.values()):
         return 0
+    if any(isinstance(v, ValueError) for v in res.values()):  # a bad argument, as for run
+        return 2
     if any(isinstance(v, Quota) for v in res.values()):
         return 10
     return 27 if any(isinstance(v, Cancelled) for v in res.values()) else 20

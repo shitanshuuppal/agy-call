@@ -394,6 +394,7 @@ def test_continue_after_the_controller_died_settles_the_old_turn_first(repo, fak
     assert store.read_json(os.path.join(att, "result.json"))["outcome"] == "interrupted"
     assert bounded(lambda: task.drive(job)).answer == "Added d."  # not the old reply
     assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add d.txt.")
+    assert all(l["settings"]["allowNonWorkspaceAccess"] is False for l in launches())
 
 
 def test_a_background_task_runs_in_a_detached_worker_and_is_found_from_its_worktree(repo, fake, tmp_path):
@@ -519,6 +520,7 @@ def test_a_foreground_continuation_is_reserved_until_its_drive_takes_it(repo, fa
     assert bounded(lambda: task.drive(job)).answer == "Created c.txt."
     assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add c.txt.")
     assert job.status()["state"] == "done"
+    assert len(launches()) == 2 and all(l["settings"]["allowNonWorkspaceAccess"] is False for l in launches())
 
 
 def _reserve_second_segment(fake):
@@ -548,6 +550,20 @@ def test_a_queued_continuation_whose_worker_died_is_released(repo, fake):
     assert store.read_json(job.path("segments", "002.json"))["taken"] is False
     assert bounded(lambda: task.drive(job)).answer == "Created d.txt."
     assert launches()[1]["prompt"] == task.prompt(_wt(), [], "Add d.txt.")
+
+
+def test_a_zombie_worker_does_not_keep_a_queued_continuation_refused(repo, fake):
+    job, launches = _reserve_second_segment(fake)
+    zombie = subprocess.Popen(["true"], start_new_session=True)  # exits, and stays unreaped until we wait
+    try:
+        wait_for(lambda: subprocess.run(["ps", "-o", "stat=", "-p", str(zombie.pid)], capture_output=True,
+                                        text=True).stdout.strip().startswith("Z"))
+        assert agy.start_time(zombie.pid)
+        _worker(job, zombie.pid, agy.start_time(zombie.pid))
+        job = bounded(lambda: task.continue_("t1", "Add d.txt."))
+        assert task.segments(job) == [1, 2, 3]
+    finally:
+        zombie.wait()
 
 
 def test_a_queued_continuation_with_a_live_worker_is_still_refused(repo, fake):

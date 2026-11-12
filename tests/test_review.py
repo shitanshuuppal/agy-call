@@ -210,6 +210,7 @@ def test_a_grant_added_between_turns_is_denied_in_the_next_launch(repo, fake, tm
     finally:
         runner._settle = settle
     first, second = launches()
+    assert first["settings"]["allowNonWorkspaceAccess"] is False and second["settings"]["allowNonWorkspaceAccess"] is False
     assert first["settings"]["permissions"]["deny"] == ["command(gcloud run)"]
     assert second["settings"]["permissions"]["deny"] == ["command(gcloud run)", "command(kubectl apply)"]
 
