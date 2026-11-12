@@ -157,17 +157,32 @@ def _next(prompt, last, launch):
     return msg, "fix"
 
 
-def _agy_output(att):
-    """True when a captured agy invocation of this attempt (not a help probe) produced output."""
-    for path in glob.glob(os.path.join(att, "agy-*.out")):
+def _agy_runs(att):
+    """The stdout of each captured agy invocation of this attempt, in order, skipping help probes."""
+    for path in sorted(glob.glob(os.path.join(att, "agy-*.out")), key=lambda p: int(p.rsplit("-", 1)[1][:-4])):
         try:
             args = json.loads(_read(path[:-4] + ".args"))
         except ValueError:
             args = []
-        probe = any(a in ("--help", "-h") for a in args) and not any(a in ("-p", "--print", "--prompt") for a in args)
-        if not probe and _read(path).strip():
-            return True
-    return False
+        if not (any(a in ("--help", "-h") for a in args) and not any(a in ("-p", "--print", "--prompt") for a in args)):
+            yield _read(path)
+
+
+def _agy_output(att):
+    """True when a captured agy invocation of this attempt (not a help probe) produced output."""
+    return any(out.strip() for out in _agy_runs(att))
+
+
+def _agy_reply(att):
+    """The reply in agy's JSON envelope; agy-delegate drops it when agy exits non-zero after writing one."""
+    for out in reversed(list(_agy_runs(att))):
+        try:
+            envelope = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(envelope, dict) and isinstance(envelope.get("response"), str) and envelope["response"].strip():
+            return envelope["response"]
+    return None
 
 
 def _launch(att, message, conv, o, kind, generation, fds):
@@ -247,7 +262,7 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
             fds.append(stack.enter_context(st.flock(conv_lock(conv))).fileno())
         last_res = st.read_json(os.path.join(done[-1], "result.json"), {}) if done else {}
         if (last_res or {}).get("outcome") == "check-error":  # the reply is saved: check it again before any new turn
-            verdict = checker(_read(os.path.join(done[-1], "delegate.out")))
+            verdict = checker(_read(os.path.join(done[-1], "delegate.out")) or _agy_reply(done[-1]) or "")
             if verdict.ok:
                 st.write_atomic(job.path("answer.txt"), verdict.answer)
                 job.set_status(state="done", answer=True, conversation=conv, findings=[])
@@ -303,7 +318,10 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                 if state:
                     job.set_status(state=state, findings=res.get("findings", []))
 
-            if rc == 0:
+            reply = _agy_reply(att) if rc in (2, 3) else None
+            if reply:  # agy failed after writing a reply (seen with its output-limit error): check that reply
+                text, res["agyError"] = reply, _reason(err)
+            if rc == 0 or reply:
                 try:
                     verdict = checker(text)
                 except CheckError as e:
@@ -324,6 +342,12 @@ def call(job_id, prompt, *, store=None, namespace=None, model=None, timeout="10m
                     finish("failed", outcome="failed", findings=["a tool call was denied twice"])
                     raise GaveUp(["a tool call was denied twice"], conv, _usage(job), job.dir)
                 finish(outcome="denied")
+            elif rc in (2, 3) and "exceeded the output token limit" in err:
+                # once a conversation hits this, every later turn in it failed the same way, so a resend only spends quota
+                findings = ["agy stopped at its output token limit without a reply; its output is saved in %s. "
+                            "Ask for the work as files on disk and a short reply" % att]
+                finish("failed", outcome="failed", findings=findings)
+                raise GaveUp(findings, conv, _usage(job), job.dir)
             elif rc in (2, 3):
                 if kind in ("retry", "retry-first"):
                     finish(outcome="rejected", findings=["agy-delegate exit %d: %s" % (rc, _reason(err))])

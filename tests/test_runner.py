@@ -467,3 +467,38 @@ def test_invalid_schema_launches_nothing(tmp_path, fake):
     with pytest.raises(ValueError):
         runner.call("j1", "q", store=S(tmp_path), model="m", schema=str(schema))
     assert launches() == []
+
+
+CUT_OFF = ("Your previous response was cut off because it exceeded the output token limit\n"
+           "Please continue from where you left off, keeping your response shorter\nRetries remaining: 3")
+
+
+def _cut_off(response):
+    """agy exited 1 with its output-limit error; its JSON envelope still holds a reply that the delegate dropped."""
+    return {"rc": 2, "conversation": "c1", "stderr": "agy exited 1\n" + CUT_OFF + "\n",
+            "agy_out": {"conversation_id": "c1", "status": "ERROR", "response": response, "error": CUT_OFF}}
+
+
+def test_output_limit_error_reply_is_checked_and_accepted(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    monkeypatch.setenv("AGYCALL_REAL_AGY", sys.executable)  # turns on the shim env, which tells the fake its attempt folder
+    set_turns(_cut_off(GOOD["stdout"]))
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", expect="json", require=["answer"])
+    assert r.answer["answer"] == "B" and len(launches()) == 1
+
+
+def test_output_limit_error_reply_that_fails_checks_gets_a_fix_turn(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    monkeypatch.setenv("AGYCALL_REAL_AGY", sys.executable)
+    set_turns(_cut_off(BAD["stdout"]), _cut_off(GOOD["stdout"]))
+    r = runner.call("j1", "q", store=S(tmp_path), model="m", expect="json", require=["answer"])
+    assert r.answer["answer"] == "B" and "no JSON value" in launches()[1]["prompt"]
+
+
+def test_output_limit_error_without_a_reply_stops_at_once(tmp_path, fake, monkeypatch):
+    set_turns, launches = fake
+    monkeypatch.setenv("AGYCALL_REAL_AGY", sys.executable)
+    set_turns(_cut_off(""))
+    with pytest.raises(GaveUp) as e:
+        runner.call("j1", "q", store=S(tmp_path), model="m", max_turns=6)
+    assert len(launches()) == 1 and "output token limit" in str(e.value)

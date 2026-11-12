@@ -19,6 +19,9 @@ with open(os.environ["FAKE_LOG"], "a") as fh:
                          "structured": os.environ.get("CLAUDE_PLUGIN_OPTION_STRUCTURED_OUTPUT")}) + "\n")
 t = turns[min(n, len(turns) - 1)]
 time.sleep(t.get("sleep", 0))
+if "agy_out" in t:  # what the capture shim would have saved from agy's own JSON output
+    open(os.path.join(os.environ["AGYCALL_ATTEMPT"], "agy-1.args"), "w").write('["-p", "x"]')
+    open(os.path.join(os.environ["AGYCALL_ATTEMPT"], "agy-1.out"), "w").write(json.dumps(t["agy_out"]))
 if t.get("conversation"):
     sys.stderr.write("AGY_USAGE " + json.dumps({"conversation_id": t["conversation"], "usage": {"output": 10, "input": 5}}) + "\n")
 sys.stderr.write(t.get("stderr", ""))

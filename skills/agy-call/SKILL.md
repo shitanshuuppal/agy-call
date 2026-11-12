@@ -85,7 +85,7 @@ Keep the store inside the project (for example `<project>/agy-jobs`) so the repl
 | 11 | agy is not authenticated (agy-delegate code passed through) |
 | 13 | agy is missing (agy-delegate code passed through) |
 | 14 | model unavailable (agy-delegate code passed through) |
-| 20 | gave up: no usable reply within `--max-turns`, or a tool call denied twice |
+| 20 | gave up: no usable reply within `--max-turns`, a tool call denied twice, or agy hit its output limit without a reply |
 | 21 | check error: the check itself failed to run; the reply is kept |
 | 22 | unknown agy-delegate exit |
 | 23 | no conversation id was captured, so a follow-up cannot be sent |
@@ -104,12 +104,25 @@ When a call fails, read `agy-N.out` of the last attempt to see what agy actually
 ## What to do per exit
 
 - 10: wait until the printed time and rerun the same command, or ask the author; do not use `--ignore-quota` to get around it.
-- 20: read the findings; rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`.
+- 20: read the findings; after an output-limit stop, send a new prompt that asks for a short reply, as a new job (see Coding tasks); otherwise rerun with a higher `--max-turns` to continue the same conversation, or change the prompt and rerun with `--new-version`.
 - 21: a rerun checks the saved reply again before any new turn, but only when the request is unchanged: repair the checker's executable or environment, not the command string, schema file or `check_id`. After changing the check, the saved reply is in `attempts/NNN/delegate.out` and the raw output in `agy-N.out`; a rerun with `--new-version` starts a new paid job.
 - 23: rerun with `--fresh` if starting a new conversation is acceptable; otherwise use the replies saved under `attempts/`.
 - 24: the request changed; use a new job id, or `--new-version` to replace the old job.
 - 25: another process holds the job; wait for it and rerun, which then returns its answer.
 - 11, 13, 14, 22: fix the setup (login, install, model name) and rerun; the job is kept.
+
+## Coding tasks
+
+In a headless run agy can write files and run commands only where `~/.gemini/antigravity-cli/settings.json` allows it; any other write or command is denied, and agy-call exits 20 after the second denial.
+The rules go in `permissions.allow`, for example `write_file(/path/to/worktree)`, `command(swift test)` or `command(regex:npm run (build|lint|test))`; a `deny` rule wins over an allow rule.
+Only the user can add these rules, because Claude Code blocks a session from editing agy's settings; before launching, give the user the exact lines to add.
+Run the task in its own git worktree on its own branch, and grant `write_file` for that worktree only.
+Ask Gemini to write the changes in place and to end with a reply of a few lines listing the files changed and anything not done; do not ask for a diff or file contents in the reply.
+A turn's reply and its thinking share one output limit, so a reply that carries a long diff can hit it; agy then fails with "exceeded the output token limit", and later turns in that conversation have failed the same way.
+agy-call still checks a reply agy wrote before that error (it is in agy's JSON in `agy-N.out`); when there is none, it exits 20 without resending.
+Pass a `--check-cmd` that builds and runs the tests in the worktree and ignores stdin when the reply is only a summary; a failing build then goes back to Gemini in the same conversation as a finding.
+Give the check a `--check-timeout` long enough for the build, give the call a `--timeout` that covers the whole task (a coding turn can run an hour), and run agy-call with run_in_background.
+In shell scripts pass each option and its value as separate words: `--conversation "$ID"`, not one string holding both.
 
 ## Multi-turn work
 
