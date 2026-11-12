@@ -47,9 +47,9 @@ def shared_grants():
     for key in ("userSettings", "globalPermissionGrants", "allow"):
         if not isinstance(node, dict):
             raise ValueError(bad)
-        node = node.get(key)
-        if node is None:
+        if key not in node:
             return []
+        node = node[key]
     if not isinstance(node, list) or not all(isinstance(g, str) for g in node):
         raise ValueError(bad)
     return node

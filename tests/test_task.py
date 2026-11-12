@@ -40,7 +40,10 @@ def test_a_missing_shared_config_or_key_means_no_deny(tmp_path):
     "{not json", "[]",
     json.dumps({"userSettings": {"globalPermissionGrants": {"allow": "command(x)"}}}),
     json.dumps({"userSettings": {"globalPermissionGrants": {"allow": [1]}}}),
-    json.dumps({"userSettings": ["x"]})])
+    json.dumps({"userSettings": ["x"]}),
+    json.dumps({"userSettings": None}),
+    json.dumps({"userSettings": {"globalPermissionGrants": None}}),
+    json.dumps({"userSettings": {"globalPermissionGrants": {"allow": None}}})])
 def test_an_unreadable_shared_config_is_refused(tmp_path, content):
     (tmp_path / "agy-config.json").write_text(content)
     with pytest.raises(ValueError, match="shared grants"):

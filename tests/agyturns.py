@@ -88,4 +88,5 @@ def bounded(fn, pids=(), timeout=30):
 
 def git(cwd, *args):
     """Run git in cwd for a test and return its stdout; a failure fails the test."""
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True).stdout
+    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+                          timeout=30).stdout
