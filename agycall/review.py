@@ -320,6 +320,8 @@ def cleanup(job_id, cwd=None):
         stack.enter_context(worktree.lock(r))
         if os.path.isdir(rv["worktree"]):
             worktree.git(r.top, "worktree", "remove", rv["worktree"])
+        else:  # a deleted folder leaves git's registration behind, and a later `worktree add` would refuse it
+            worktree.git(r.top, "worktree", "prune")  # drops only registrations whose folder is gone
         if worktree._ok(r.top, "show-ref", "--verify", "--quiet", rv["ref"]):
             worktree.git(r.top, "update-ref", "-d", rv["ref"])
     return "removed the snapshot worktree %s and %s; the review record stays in %s" % (rv["worktree"], rv["ref"],

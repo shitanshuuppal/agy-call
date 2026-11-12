@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -459,3 +460,32 @@ def test_a_rerun_after_cleanup_of_an_unfinished_review_makes_the_snapshot_again(
     quota.clear("m", quota.generation("m"))
     assert review.drive(review.start(model="m")).text and len(launches()) == 2
     assert os.path.isdir(rv["worktree"]) and _refs(repo) == ["refs/agy-call/" + job.id]
+
+
+def test_cleanup_after_the_snapshot_folder_was_deleted_drops_its_registration(repo, fake):
+    set_turns, launches = fake
+    _changed(repo, "a.txt")
+    set_turns(quota_error(), reply(_review_json(["a.txt"])))
+    job = review.start(model="m")
+    with pytest.raises(Quota):
+        review.drive(job)
+    rv = _rv(job)
+    other = worktree.repo().top + "-other"
+    git(repo, "worktree", "add", "-q", "--detach", other)  # an unrelated registration whose folder exists
+    shutil.rmtree(rv["worktree"])
+    assert review.cleanup(job.id)[1] == 0 and _refs(repo) == []
+    listed = git(repo, "worktree", "list")
+    assert rv["worktree"] not in listed and os.path.basename(other) in listed
+    quota.clear("m", quota.generation("m"))
+    assert review.drive(review.start(model="m")).text and len(launches()) == 2
+    assert os.path.isdir(rv["worktree"])
+    git(repo, "worktree", "remove", "--force", other)
+
+
+def test_a_failed_foreground_review_prints_the_error_the_result_and_exits_with_its_code(repo, fake):
+    set_turns, _ = fake
+    _changed(repo, "a.txt")
+    set_turns(reply("Looks good to me."))
+    r = run_cli("review", "--model", "m", cwd=str(repo))
+    assert r.returncode != 0 and "no JSON value" in r.stderr
+    assert "state: failed" in r.stdout and "last reply (attempt" in r.stdout and "Looks good to me." in r.stdout
