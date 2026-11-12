@@ -52,5 +52,5 @@ def test_the_shipped_text_has_no_em_dash_and_no_banned_word():
                              for p in glob.glob(os.path.join(ROOT, pattern)) if os.path.isfile(p)]
     for path in paths:
         text = read(path)
-        assert "—" not in text, path
+        assert "\u2014" not in text, path
         assert not banned.search(text), path
