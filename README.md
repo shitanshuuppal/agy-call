@@ -17,6 +17,7 @@ agy-call sits between Claude and Gemini and handles both:
 - It can check answers for you, for example requiring valid JSON with certain fields, and sends a reply back when the format is wrong.
 - A call can run in the background; `agy-call status`, `result` and `cancel` show how it is going, print its answer and stop it.
 - It can hand a coding task to Gemini in its own git worktree and branch, with a permission grant made for that task only, and merge the checked result locally; agy-call cannot limit what a granted command does, because a test command runs the repository's own code.
+- It can have Gemini review the current change in a read-only snapshot and return a checked list of findings, each with a severity, tied to the exact code reviewed.
 
 The optional guard hook stops Claude from calling `agy` directly, so every call goes through agy-call.
 

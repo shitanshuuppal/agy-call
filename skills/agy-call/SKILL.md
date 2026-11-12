@@ -80,7 +80,7 @@ Keep the store inside the project (for example `<project>/agy-jobs`) so the repl
 
 ## Status, result and cancel
 
-`agy-call status [JOB] [--all] [--store DIR] [--namespace NAME]` lists the jobs of a store, one line each: the id, the state, the kind (`run` or `task`), the age and the last finding.
+`agy-call status [JOB] [--all] [--store DIR] [--namespace NAME]` lists the jobs of a store, one line each: the id, the state, the kind (`run`, `task` or `review`), the age and the last finding.
 Without `--store` or `--namespace`, `status`, `result` and `cancel` use the task store of the current git repository when they run inside one (a task's worktree counts), and the default store otherwise; pass `--namespace default` for `run` jobs of the default store from inside a repository.
 `--all` lists every store under `~/.agy-call/jobs`, repository stores and namespace stores, one block per store.
 Jobs started in the current Claude session (the `AGYCALL_SESSION` variable, recorded in `request.json`) come first, then the others, newest first in each group.
@@ -90,6 +90,7 @@ A queued, running or checking job with none of these alive lost its process; rer
 `agy-call result [JOB]` prints the accepted answer of a `done` job and exits 0.
 For any other state it prints the state, the findings and the last saved reply, and exits with that state's code: 10 quota, 20 failed, 21 check error, 23 no conversation, 25 queued, running or checking, 27 cancelled, 28 blocked, and for `fatal` or `setup-error` the setup code the job recorded (11, 13, 14 or 22).
 For a task it then prints the hand-back (see Coding tasks).
+For a `done` review it prints the findings instead of the JSON (see Reviews).
 An `interrupted` job exits 1.
 Without a job id it uses the newest finished job of the current session.
 
@@ -115,9 +116,9 @@ Replies already received are kept.
 | `quota` | a quota hold stopped the job |
 | `check-error` | the check itself failed to run |
 | `no-conversation` | a follow-up was needed but no conversation id was captured |
-| `blocked` | a task's reply had `NEED:` lines or agy refused an action (exit 28); waiting for a wider grant |
+| `blocked` | a task's or a review's reply had `NEED:` lines or agy refused an action (exit 28); waiting for a wider grant |
 | `fatal` | agy is missing or not signed in, the model is unknown, or agy's output was not a JSON envelope |
-| `setup-error` | the same as `fatal`, for a task |
+| `setup-error` | the same as `fatal`, for a task or a review |
 | `cancelled` | stopped by `cancel` |
 | `interrupted` | the process running the job died and the saved output did not settle the turn; the rerun that found it restarts the turn |
 
@@ -136,9 +137,9 @@ Replies already received are kept.
 | 23 | no conversation id was captured, so a follow-up cannot be sent |
 | 24 | the job exists with a different request |
 | 25 | the job is running in another process; from `result`, the job is still queued, running or checking; from `cancel`, it is still stopping |
-| 26 | repository state: not inside a git repository, uncommitted or untracked files, a detached HEAD, a missing worktree, or a merge, cleanup or discard that the repository's state refuses |
+| 26 | repository state: not inside a git repository, uncommitted or untracked files, a detached HEAD, a missing worktree, nothing to review, an existing snapshot folder that is not the clean detached worktree at the recorded commit, or a merge, cleanup or discard that the repository's state refuses |
 | 27 | the job was cancelled |
-| 28 | a task is blocked on permission: its reply had `NEED:` lines or agy refused an action |
+| 28 | a task or a review is blocked on permission: its reply had `NEED:` lines or agy refused an action |
 
 An error that is not one of these (for example a bad argument) exits with 1 or 2.
 
@@ -155,6 +156,7 @@ When the process running a job died, the next run of the same job reads the save
 A complete reply found there is checked as if it had just arrived, but agy's exit status was lost, so it is accepted only by a check you asked for and no follow-up is sent after it.
 Output that is not a complete reply restarts the turn.
 A task's record is `~/.agy-call/jobs/<repo id>/<job>/`; beside the files above it holds `grant-<n>.json` (the grant passed with `--settings`), `segments/NNN.json` (each segment's prompt, grant and budget), `segments/NNN-answer.txt` (an earlier segment's answer), and `merge.json`, `merge-failed.json` and `cleanup.json` once those commands ran.
+A review's record is in the same repository store; beside the attempt files it holds `schema.json` (the findings schema passed with `--json-schema`), `grant-1.json` (its read-only grant) and, once it is done, `answer.txt` with the accepted findings as JSON.
 
 ## What to do per exit
 
@@ -248,6 +250,46 @@ The job record is kept, and `task --new-version` starts the same job id again on
 A turn's reply and its thinking share one output limit, so a reply that carries a long diff can hit it; agy then fails with "exceeded the output token limit", and later turns in that conversation have failed the same way.
 agy-call still checks a reply agy wrote before that error (it is in `reply.txt`); when there is none, it exits 20 without resending.
 In shell scripts pass each option and its value as separate words: `--conversation "$ID"`, not one string holding both.
+
+## Reviews
+
+`agy-call review` has Gemini review the current change of the repository and returns a list of findings with a severity each, tied to the exact code it reviewed.
+Run it from inside the repository:
+
+```
+agy-call review --model M [--effort E] [--scope auto|working-tree|branch] [--base REF] [--adversarial] [--focus TEXT] [--job ID] [--max-turns N] [--timeout T] [--background]
+agy-call review --cleanup JOB
+```
+
+- `--scope working-tree` reviews the staged, unstaged and untracked files that are not ignored, against `HEAD`.
+- `--scope branch` reviews `merge-base(BASE, HEAD)..HEAD`; `--base` names BASE and defaults to `origin/HEAD`, else `main`, else `master`; `--base` applies to the branch scope only.
+- `--scope auto` is `working-tree` when `git status --porcelain` shows anything and `branch` otherwise [`auto`].
+- Finding the scope never writes your index; the working-tree snapshot is built through a copy of it.
+- When the target has no change, it exits 26 with "nothing to review".
+- agy-call keeps a snapshot of the target as a commit under `refs/agy-call/<job>` and checks it out in a detached worktree, `~/.agy-call/worktrees/<repo id>/.snap/<job>/`; your index, files and branches are not touched, and edits made while the review runs are not in it.
+- A snapshot folder that already exists is reused on a rerun only when it is a clean, detached worktree at the recorded commit; anything else exits 26 and is left as it is.
+- Gemini reads the snapshot with a grant of the read-only commands only (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `git status`, `git diff`, `git log`, `git show`), with no file writes and no `--allow` entries, and with the same deny list of shared grants as a task.
+- `--adversarial` tells Gemini to assume the change has defects and to challenge the approach and the design choices as well as the code; such a finding may have no file.
+- `--focus TEXT` tells Gemini what to give particular attention to.
+- Without `--job` the id is `review-standard-<16 hex>` or `review-adversarial-<16 hex>`, taken from the review's identity: the repository, the base commit, the snapshot's tree, the scope, the adversarial flag, the focus text, the model, the effort and the schema.
+  The same code under the same settings returns the saved review without a launch, at any later time, and any change to the code or the settings starts a new review.
+- `--max-turns` counts every launch [3]; a review may run 2 hours in all across its turns; `--timeout` limits one turn [`20m`].
+- `--background` takes the snapshot, prints the job id and runs the review in a detached worker; follow it with `agy-call status` and `agy-call result JOB`.
+- Run in the foreground, `review` prints the result and exits with the job's code; this holds after a recorded failure too, so the state, the findings and the last reply are shown either way.
+
+Gemini replies with one JSON object: a verdict (`approve`, `changes-needed` or `incomplete`), a summary, `files_reviewed`, and findings with a severity (`MUST-FIX`, `SHOULD-FIX` or `NIT`), a title, the file and lines, how the problem is reached and the fix.
+agy passes the schema to Gemini with `--json-schema`, and agy-call checks the reply again.
+A schema that uses a keyword the checker does not enforce exits 2 before any launch.
+A reply that breaks the schema, names a file outside the change, has `line_start` after `line_end`, or approves with a MUST-FIX or SHOULD-FIX finding gets a turn in the same conversation that asks only for the format to be fixed.
+A reply that leaves changed files out of `files_reviewed` is kept with its verdict set to `incomplete` and the missing files listed, and no further turn is sent, because covering them is a new review that you have to ask for.
+A reply that came with an agy error is accepted only when it passes these checks, and gets no format-repair turn.
+`NEED:` lines or a refused command end the review `blocked` (exit 28), as for a task.
+A review that ended `failed` or `blocked` keeps that stop on a rerun; to review again, pass another `--job`.
+
+`agy-call result JOB` for a done review prints the verdict, the number of findings at each severity, one block per finding (severity and title, where, how it is reached, the fix) and the path of the full JSON.
+When the code of the same scope has changed since the snapshot, it adds `code changed since this review (snapshot X, now Y)` with the two tree ids.
+agy-call never starts a fix or a second review by itself; follow the user's rules for review loops.
+`agy-call review --cleanup JOB` removes the snapshot worktree and the ref, and keeps the job record and its findings; it exits 25 while the review runs.
 
 ## Multi-turn work
 
