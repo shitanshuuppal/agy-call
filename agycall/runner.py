@@ -332,7 +332,7 @@ def _settle(c, att, oc, recovered=False):
         if name == "timeout":
             give_up(["%s; the partial reply and the worktree are kept; continue with task --continue" % oc.reason])
         if name == "empty":
-            if c.conv and launch.get("kind") != "summary":
+            if c.conv and launch.get("message") != SUMMARY_ONLY:  # the message survives a retry, the kind does not
                 finish(outcome="summary", findings=[oc.reason])  # one turn that asks only for the final summary
                 return None
             give_up(["%s; a coding task is never resent blind; continue with task --continue" % oc.reason])

@@ -530,3 +530,15 @@ def test_a_successful_check_cannot_outlast_the_segment_deadline(repo, fake):
         bounded(lambda: task.drive(job))
     assert time.monotonic() - t0 < 6 and len(launches()) == 1
     assert job.status()["state"] == "failed" and not os.path.exists(job.path("answer.txt"))
+
+
+def test_the_summary_follow_up_stays_single_when_it_hits_quota_and_is_retried(repo, fake):
+    set_turns, launches = fake
+    set_turns(empty(conv="c1"), quota_error(), empty(conv="c1"))
+    job = _start(max_turns=6)
+    with pytest.raises(Quota):
+        task.drive(job)
+    quota.clear("m", quota.generation("m"))
+    with pytest.raises(GaveUp, match="never resent blind"):
+        bounded(lambda: task.drive(_start(max_turns=6)))
+    assert [l["prompt"] == runner.SUMMARY_ONLY for l in launches()] == [False, True, True]
